@@ -1,9 +1,10 @@
 # diffusion.py
 # DDPM core with linear/cosine beta schedules, stable posterior, and CFG sampling.
+from __future__ import annotations  # deve restare la prima riga
 
-from typing import Optional, Tuple, Literal
-import torch
-import torch.nn as nn
+import math, torch, numpy as np
+from torch import nn
+import torch.nn.functional as F  # <-- AGGIUNTO: serve per F.mse_loss
 
 
 Schedule = Literal["linear", "cosine"]
