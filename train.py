@@ -1,15 +1,10 @@
-# train.py
-# Line-by-line commented training loop for DDPM on CUB-200-2011.
 from __future__ import annotations
-
 import os
 from argparse import ArgumentParser
-
 import torch
 from torch.optim import AdamW
-from torch import amp          
+from torch import amp
 from tqdm import tqdm
-
 from utils import set_seed, TrainConfig, ensure_dir, save_grid, EMA
 from data import make_loader
 from unet import UNet
@@ -24,92 +19,55 @@ def parse_args() -> TrainConfig:
     ap.add_argument('--lr', type=float, default=2e-4)
     ap.add_argument('--ema_decay', type=float, default=0.999)
     ap.add_argument('--num_steps', type=int, default=1000)
-    ap.add_argument('--cond_mode', type=str, default='class', choices=['none', 'class'])
+    ap.add_argument('--cond_mode', type=str, default='class', choices=['none','class'])
     ap.add_argument('--num_classes', type=int, default=200)
     ap.add_argument('--guidance_scale', type=float, default=1.0)
     ap.add_argument('--p_uncond', type=float, default=0.1)
-    ap.add_argument('--schedule', type=str, default='cosine', choices=['linear', 'cosine'])
+    ap.add_argument('--schedule', type=str, default='cosine', choices=['linear','cosine'])
     ap.add_argument('--outdir', type=str, default='runs')
-    ap.add_argument('--num_workers', type=int, default=2)
+    ap.add_argument('--num_workers', type=int, default=2)   # 👍 Colab-safe
+    ap.add_argument('--base', type=int, default=96)         # riduci canali se serve memoria
     args = ap.parse_args()
-
-    cfg = TrainConfig(
-        data_root=args.data_root,
-        img_size=args.img_size,
-        batch_size=args.batch_size,
-        epochs=args.epochs,
-        lr=args.lr,
-        ema_decay=args.ema_decay,
-        num_steps=args.num_steps,
-        cond_mode=args.cond_mode,
-        num_classes=args.num_classes,
-        guidance_scale=args.guidance_scale,
-        p_uncond=args.p_uncond,
-        schedule=args.schedule,
-        outdir=args.outdir,
-    )
+    cfg = TrainConfig(data_root=args.data_root, img_size=args.img_size, batch_size=args.batch_size,
+                      epochs=args.epochs, lr=args.lr, ema_decay=args.ema_decay, num_steps=args.num_steps,
+                      cond_mode=args.cond_mode, num_classes=args.num_classes, guidance_scale=args.guidance_scale,
+                      p_uncond=args.p_uncond, schedule=args.schedule, outdir=args.outdir)
     cfg.num_workers = args.num_workers  # type: ignore[attr-defined]
+    cfg.base = args.base                # type: ignore[attr-defined]
     return cfg
 
 def main() -> None:
-    cfg = parse_args()
-    set_seed(42)
-
-    device = cfg.device
-    ensure_dir(cfg.outdir)
-
+    cfg = parse_args(); set_seed(42)
+    device = cfg.device; ensure_dir(cfg.outdir)
     loader = make_loader(cfg.data_root, cfg.img_size, cfg.batch_size, split="train",
                          num_workers=getattr(cfg, "num_workers", 2))
-
-    model = UNet(img_channels=3, base=128, ch_mults=(1,2,2,4),
+    model = UNet(img_channels=3, base=getattr(cfg,"base",96), ch_mults=(1,2,2,4),
                  attn_res=(16,), num_classes=cfg.num_classes, cond_mode=cfg.cond_mode, t_dim=256).to(device)
     diffusion = Diffusion(T=cfg.num_steps, schedule=cfg.schedule, device=device)
-
     optim = AdamW(model.parameters(), lr=cfg.lr, weight_decay=0.0)
     ema = EMA(model, decay=cfg.ema_decay)
-    scaler = amp.GradScaler(enabled=torch.cuda.is_available())  # ✅ new API
+    scaler = amp.GradScaler(enabled=torch.cuda.is_available())
 
     global_step = 0
     for epoch in range(cfg.epochs):
         model.train()
         pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{cfg.epochs}")
         for x, y in pbar:
-            x = x.to(device)
-            y = y.to(device) if cfg.cond_mode == 'class' else None
+            x = x.to(device); y = y.to(device) if cfg.cond_mode=='class' else None
             t = torch.randint(0, cfg.num_steps, (x.size(0),), device=device).long()
-
             optim.zero_grad(set_to_none=True)
-            #  autocast API
-            with amp.autocast(device_type='cuda', enabled=torch.cuda.is_available()):
+            with amp.autocast(device_type='cuda', dtype=torch.float16, enabled=torch.cuda.is_available()):
                 loss = diffusion.p_losses(model, x, t, y=y, p_uncond=cfg.p_uncond)
+            scaler.scale(loss).backward(); scaler.step(optim); scaler.update(); ema.update()
+            global_step += 1; pbar.set_postfix(loss=float(loss))
 
-            scaler.scale(loss).backward()
-            scaler.step(optim)
-            scaler.update()
-            ema.update()
-
-            global_step += 1
-            pbar.set_postfix(loss=float(loss))
-
-        model.eval()
-        ema.store(); ema.copy_to()
+        model.eval(); ema.store(); ema.copy_to()
         with torch.no_grad():
-            y_sample = None
-            if cfg.cond_mode == 'class':
-                y_sample = torch.randint(0, cfg.num_classes, (64,), device=device)
-            samples = diffusion.sample(model, (64, 3, cfg.img_size, cfg.img_size),
-                                       y=y_sample, guidance_scale=cfg.guidance_scale)
-        save_grid(samples, os.path.join(cfg.outdir, f"samples_epoch_{epoch+1:03d}.png"), nrow=8)
-        ema.restore()
-
-        ckpt = {
-            'model': model.state_dict(),
-            'ema': ema.shadow,
-            'optim': optim.state_dict(),
-            'cfg': cfg.__dict__,
-            'epoch': epoch + 1,
-            'global_step': global_step,
-        }
+            y_sample = torch.randint(0, cfg.num_classes, (64,), device=device) if cfg.cond_mode=='class' else None
+            samples = diffusion.sample(model, (64,3,cfg.img_size,cfg.img_size), y=y_sample, guidance_scale=cfg.guidance_scale)
+        save_grid(samples, os.path.join(cfg.outdir, f"samples_epoch_{epoch+1:03d}.png"), nrow=8); ema.restore()
+        ckpt = {'model': model.state_dict(), 'ema': ema.shadow, 'optim': optim.state_dict(),
+                'cfg': cfg.__dict__, 'epoch': epoch+1, 'global_step': global_step}
         torch.save(ckpt, os.path.join(cfg.outdir, 'last.ckpt'))
 
 if __name__ == "__main__":
