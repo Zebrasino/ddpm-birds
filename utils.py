@@ -3,10 +3,9 @@
 from __future__ import annotations  # Enable future annotations behavior for forward references
 
 import os  # For interacting with the operating system (paths, folders)
-import math  # Might be useful for numeric helpers
 import random  # Python's random for reproducible seeds alongside numpy/torch
 from dataclasses import dataclass  # Convenient container for configuration objects
-from typing import Any, Dict  # Type hints for readability and static checking
+from typing import Dict  # Type hints for readability and static checking
 
 import numpy as np  # For numeric utilities and seeding
 import torch  # Core deep learning library
@@ -22,68 +21,65 @@ def set_seed(seed: int = 42) -> None:
     torch.backends.cudnn.benchmark = False  # Disable benchmark to avoid nondeterministic algorithms
 
 class EMA:
-    """Exponential Moving Average for model parameters, typically stabilizes sampling."""
+    """Exponential Moving Average for model parameters; stabilizes sampling."""
     def __init__(self, model: torch.nn.Module, decay: float = 0.999):
-        self.model = model  # Reference to the model whose weights we track
-        self.decay = decay  # EMA decay rate; larger means slower updates, more smoothing
-        self.shadow: Dict[str, torch.Tensor] = {}  # Dict storing the moving-averaged weights
-        self.backup: Dict[str, torch.Tensor] = {}  # Optional backup for swapping
-
-        # Initialize shadow weights as a copy of current parameters
+        self.model = model  # Reference to the model to track
+        self.decay = decay  # EMA decay factor
+        self.shadow: Dict[str, torch.Tensor] = {}  # Dict storing moving averages
+        self.backup: Dict[str, torch.Tensor] = {}  # Backup for temporary swaps
+        # Initialize shadow weights as copies of current parameters
         for name, param in model.named_parameters():
-            if param.requires_grad:  # Track only trainable parameters
+            if param.requires_grad:
                 self.shadow[name] = param.data.clone()
 
-    @torch.no_grad()  # No gradients needed when updating EMA weights
+    @torch.no_grad()
     def update(self) -> None:
-        """Update EMA weights using the current model parameters."""
+        """Update EMA weights using current model parameters."""
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
-                continue  # Skip frozen parameters
-            assert name in self.shadow, "Unexpected parameter in EMA"
-            new_avg = self.decay * self.shadow[name] + (1.0 - self.decay) * param.data
-            self.shadow[name] = new_avg  # Store the updated moving average
+                continue
+            self.shadow[name] = self.decay * self.shadow[name] + (1.0 - self.decay) * param.data
 
     def store(self) -> None:
-        """Save current model parameters to self.backup for a temporary swap."""
+        """Backup current model parameters before swapping to EMA weights."""
         self.backup = {name: p.data.clone() for name, p in self.model.named_parameters()}
 
     def copy_to(self) -> None:
-        """Copy EMA (shadow) weights to the model for evaluation/sampling."""
+        """Copy EMA (shadow) weights into the model for evaluation/sampling."""
         for name, param in self.model.named_parameters():
             if name in self.shadow:
                 param.data.copy_(self.shadow[name])
 
     def restore(self) -> None:
-        """Restore original model parameters from self.backup after evaluation."""
+        """Restore original model parameters after evaluation."""
         for name, param in self.model.named_parameters():
             if name in self.backup:
                 param.data.copy_(self.backup[name])
-        self.backup = {}  # Clear backup after restoring
+        self.backup = {}
 
 def ensure_dir(path: str) -> None:
     """Create directory if it does not exist."""
-    os.makedirs(path, exist_ok=True)  # Recursively create folders as needed
+    os.makedirs(path, exist_ok=True)
 
 def save_grid(tensor: torch.Tensor, path: str, nrow: int = 8, normalize: bool = True) -> None:
-    """Save a grid of images to disk, normalizing from [-1,1] to [0,1] if needed."""
-    ensure_dir(os.path.dirname(path) or ".")  # Make sure the output folder exists
-    save_image(tensor, path, nrow=nrow, normalize=normalize, value_range=(-1, 1))  # Persist PNG grid
+    """Save a grid of images; uses value_range (-1,1) when normalize=True."""
+    ensure_dir(os.path.dirname(path) or ".")
+    save_image(tensor, path, nrow=nrow, normalize=normalize, value_range=(-1, 1))
 
 @dataclass
 class TrainConfig:
     """Configuration values used by training and evaluation scripts."""
-    data_root: str = "./CUB_200_2011"  # Root path to the dataset
-    img_size: int = 64  # Target image resolution (square), e.g., 64 or 128
-    batch_size: int = 64  # Batch size per step
-    epochs: int = 50  # Number of training epochs
-    lr: float = 2e-4  # Learning rate for AdamW
-    ema_decay: float = 0.999  # EMA decay factor
-    num_steps: int = 1000  # Number of diffusion steps T
-    cond_mode: str = "class"  # Conditioning: 'none' | 'class'
-    num_classes: int = 200  # CUB has 200 bird species
-    guidance_scale: float = 1.0  # Classifier-free guidance scale
-    p_uncond: float = 0.1  # Dropout rate for unconditional branch (CFG)
-    schedule: str = "cosine"  # 'linear' or 'cosine'
-    outdir: str = "runs"  # Where to store checkpoints and samples
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"  # Compute device
+    data_root: str = "./CUB_200_2011"
+    img_size: int = 64
+    batch_size: int = 64
+    epochs: int = 50
+    lr: float = 2e-4
+    ema_decay: float = 0.999
+    num_steps: int = 1000
+    cond_mode: str = "class"   # 'none' | 'class'
+    num_classes: int = 200
+    guidance_scale: float = 1.0
+    p_uncond: float = 0.1
+    schedule: str = "cosine"   # 'linear' | 'cosine'
+    outdir: str = "runs"
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"

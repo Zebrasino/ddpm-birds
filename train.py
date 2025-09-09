@@ -4,10 +4,8 @@ from __future__ import annotations  # Future annotations
 
 import os  # Filesystem operations
 from argparse import ArgumentParser  # CLI argument parsing
-from pathlib import Path  # Path handling
 
 import torch  # Deep learning core
-import torch.nn as nn  # For loss/optimizers
 from torch.optim import AdamW  # Optimizer with decoupled weight decay
 from torch.cuda.amp import GradScaler, autocast  # Mixed precision for speed
 from tqdm import tqdm  # Progress bars
@@ -33,9 +31,10 @@ def parse_args() -> TrainConfig:
     ap.add_argument('--p_uncond', type=float, default=0.1)
     ap.add_argument('--schedule', type=str, default='cosine', choices=['linear', 'cosine'])
     ap.add_argument('--outdir', type=str, default='runs')
+    # Optional: keep small workers on Colab
+    ap.add_argument('--num_workers', type=int, default=2)
     args = ap.parse_args()
 
-    # Populate TrainConfig from parsed args
     cfg = TrainConfig(
         data_root=args.data_root,
         img_size=args.img_size,
@@ -51,71 +50,65 @@ def parse_args() -> TrainConfig:
         schedule=args.schedule,
         outdir=args.outdir,
     )
+    # Attach non-dataclass args if needed
+    cfg.num_workers = args.num_workers  # type: ignore[attr-defined]
     return cfg
 
 def main() -> None:
     """Main training entrypoint."""
     cfg = parse_args()  # Read CLI args
-    set_seed(42)  # Use a fixed seed for reproducibility
+    set_seed(42)  # Fixed seed for reproducibility
 
     device = cfg.device  # Choose CUDA if available
-    ensure_dir(cfg.outdir)  # Create output directory for checkpoints and samples
+    ensure_dir(cfg.outdir)  # Output directory
 
-    # Build dataloader
-    loader = make_loader(cfg.data_root, cfg.img_size, cfg.batch_size, split="train")
+    # Build dataloader (use few workers on Colab to avoid warnings/freezes)
+    loader = make_loader(cfg.data_root, cfg.img_size, cfg.batch_size, split="train", num_workers=getattr(cfg, "num_workers", 2))
 
     # Instantiate model and diffusion process
     model = UNet(img_channels=3, base=128, ch_mults=(1,2,2,4),
                  attn_res=(16,), num_classes=cfg.num_classes, cond_mode=cfg.cond_mode, t_dim=256).to(device)
     diffusion = Diffusion(T=cfg.num_steps, schedule=cfg.schedule, device=device)
 
-    # Set up optimizer, EMA, and mixed precision scaler
+    # Optimizer, EMA, and mixed precision scaler
     optim = AdamW(model.parameters(), lr=cfg.lr, weight_decay=0.0)
     ema = EMA(model, decay=cfg.ema_decay)
     scaler = GradScaler(enabled=torch.cuda.is_available())
 
-    # Training loop across epochs
-    global_step = 0  # Counter for logging/checkpoints
-    for epoch in range(cfg.epochs):
-        model.train()  # Set model to training mode
-        pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{cfg.epochs}")  # Progress bar over batches
-        for x, y in pbar:
-            x = x.to(device)  # Move images to device
-            y = y.to(device) if cfg.cond_mode == 'class' else None  # Labels if class-conditional
-            # Sample a random timestep for each item in the batch
-            t = torch.randint(0, cfg.num_steps, (x.size(0),), device=device).long()
+    global_step = 0  # For logging/checkpoints
+    for epoch in range(cfg.epochs):  # Epoch loop
+        model.train()  # Train mode
+        pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{cfg.epochs}")  # Progress bar
+        for x, y in pbar:  # Batch loop
+            x = x.to(device)  # Move images
+            y = y.to(device) if cfg.cond_mode == 'class' else None  # Labels if conditional
+            t = torch.randint(0, cfg.num_steps, (x.size(0),), device=device).long()  # Random timesteps
 
             optim.zero_grad(set_to_none=True)  # Reset gradients
-            with autocast(enabled=torch.cuda.is_available()):  # Mixed precision context
-                # Compute DDPM loss (MSE between predicted and true noise)
-                loss = diffusion.p_losses(model, x, t, y=y, p_uncond=cfg.p_uncond)
+            with autocast(enabled=torch.cuda.is_available()):  # Mixed precision
+                loss = diffusion.p_losses(model, x, t, y=y, p_uncond=cfg.p_uncond)  # DDPM loss
 
-            # Backpropagate with gradient scaling to avoid underflow
-            scaler.scale(loss).backward()
-            scaler.step(optim)
-            scaler.update()
+            scaler.scale(loss).backward()  # Backprop (scaled)
+            scaler.step(optim)  # Optimizer step
+            scaler.update()  # Update scaler
+            ema.update()  # EMA step
 
-            # Update EMA weights after each step
-            ema.update()
+            global_step += 1  # Update step counter
+            pbar.set_postfix(loss=float(loss))  # Log loss
 
-            global_step += 1  # Increment step counter
-            pbar.set_postfix(loss=float(loss))  # Show current loss
-
-        # At the end of each epoch, generate a small sample grid for qualitative monitoring
-        model.eval()  # Switch to eval for sampling
-        ema.store()  # Backup current weights
-        ema.copy_to()  # Load EMA weights into the model for cleaner samples
+        # At end of epoch: sample a grid for qualitative monitoring
+        model.eval()  # Eval mode
+        ema.store(); ema.copy_to()  # Swap to EMA weights
         with torch.no_grad():
-            # Sample 64 images with optional classifier-free guidance
             y_sample = None
             if cfg.cond_mode == 'class':
-                y_sample = torch.randint(0, cfg.num_classes, (64,), device=device)
+                y_sample = torch.randint(0, cfg.num_classes, (64,), device=device)  # Random labels
             samples = diffusion.sample(model, (64, 3, cfg.img_size, cfg.img_size),
-                                       y=y_sample, guidance_scale=cfg.guidance_scale)
-        save_grid(samples, os.path.join(cfg.outdir, f"samples_epoch_{epoch+1:03d}.png"), nrow=8)
-        ema.restore()  # Restore original (non-EMA) weights
+                                       y=y_sample, guidance_scale=cfg.guidance_scale)  # Generate
+        save_grid(samples, os.path.join(cfg.outdir, f"samples_epoch_{epoch+1:03d}.png"), nrow=8)  # Save grid
+        ema.restore()  # Restore non-EMA weights
 
-        # Save checkpoint after each epoch
+        # Save checkpoint
         ckpt = {
             'model': model.state_dict(),
             'ema': ema.shadow,
@@ -124,7 +117,7 @@ def main() -> None:
             'epoch': epoch + 1,
             'global_step': global_step,
         }
-        torch.save(ckpt, os.path.join(cfg.outdir, 'last.ckpt'))
+        torch.save(ckpt, os.path.join(cfg.outdir, 'last.ckpt'))  # Write to disk
 
 if __name__ == "__main__":
     main()

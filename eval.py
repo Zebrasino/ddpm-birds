@@ -31,7 +31,7 @@ def make_real_loader(real_dir: str, img_size: int, batch_size: int = 64):
         transforms.Normalize(mean=[0.5,0.5,0.5], std=[0.5,0.5,0.5]),
     ])
     ds = datasets.ImageFolder(real_dir, transform=tfm)  # Folder structure: class folders under real_dir
-    dl = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    dl = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
     return dl
 
 class SmallDiscriminator(nn.Module):
@@ -73,15 +73,12 @@ def task_sample(args):
     N = args.num_samples  # Number of images to sample
     y = None
     if cfg['cond_mode'] == 'class':
-        # If conditional, randomly choose labels to diversify the grid
-        y = torch.randint(0, cfg['num_classes'], (N,), device=device)
-    # Sample images in [-1,1]
+        y = torch.randint(0, cfg['num_classes'], (N,), device=device)  # Random labels
     with torch.no_grad():
         x = diffusion.sample(model, (N, 3, args.img_size, args.img_size),
                              y=y, guidance_scale=args.guidance_scale)
-    # Save grid
-    ensure_dir(args.outdir)
-    save_grid(x, os.path.join(args.outdir, f"samples_{N}.png"), nrow=int(N**0.5))
+    ensure_dir(args.outdir)  # Make sure output folder exists
+    save_grid(x, os.path.join(args.outdir, f"samples_{N}.png"), nrow=int(N**0.5))  # Save grid
 
 def task_fid(args):
     """Compute FID (and optionally Precision/Recall) if torch-fidelity is available."""
@@ -89,13 +86,12 @@ def task_fid(args):
         print("torch-fidelity not installed; please `pip install torch-fidelity` to compute FID.")
         return
     model, diffusion, cfg, device = load_checkpoint(args.checkpoint)
-    # Prepare a temporary directory to write generated images for evaluation
-    gen_dir = Path(args.outdir) / "gen_tmp"
+    gen_dir = Path(args.outdir) / "gen_tmp"  # Temporary dir for generated images
     ensure_dir(str(gen_dir))
-    # Generate approximately the same number of images as in the real set (or a fixed budget)
-    target = args.num_gen if args.num_gen > 0 else 5000
-    bs = 64
-    written = 0
+    target = args.num_gen if args.num_gen > 0 else 5000  # Generation budget
+    bs = 64  # Batch size for generation
+    written = 0  # Counter
+
     with torch.no_grad():
         pbar = tqdm(range(0, target, bs), desc="Generating for FID")
         for _ in pbar:
@@ -104,88 +100,61 @@ def task_fid(args):
                 y = torch.randint(0, cfg['num_classes'], (bs,), device=device)
             x = diffusion.sample(model, (bs, 3, args.img_size, args.img_size),
                                  y=y, guidance_scale=args.guidance_scale)
-            # Map from [-1,1] to [0,1] for saving to disk
-            x_vis = (x.clamp(-1,1) + 1) / 2
+            x_vis = (x.clamp(-1,1) + 1) / 2  # Map to [0,1]
             for i in range(bs):
                 path = gen_dir / f"gen_{written+i:06d}.png"
-                save_grid(x_vis[i].unsqueeze(0), str(path), nrow=1, normalize=False)
+                save_grid(x_vis[i].unsqueeze(0), str(path), nrow=1, normalize=False)  # Save one by one
             written += bs
             if written >= target:
                 break
-    # Use torch-fidelity to compute metrics against real_dir
+
     metrics = calculate_metrics(input1=str(gen_dir), input2=args.real_dir,
                                 cuda=torch.cuda.is_available(),
                                 isc=False, fid=True, kid=False, prc=True, verbose=True)
-    print(metrics)  # Print a dict with FID and PRC metrics
+    print(metrics)  # Print dict with FID and PRC
 
 def task_two_sample(args):
     """Train a small discriminator to distinguish real vs generated; report accuracy."""
     model, diffusion, cfg, device = load_checkpoint(args.checkpoint)
     real_loader = make_real_loader(args.real_dir, args.img_size, batch_size=64)
+    D = SmallDiscriminator(in_ch=3, base=64).to(device)  # Discriminator
+    opt = torch.optim.Adam(D.parameters(), lr=2e-4)  # Optimizer
+    bce = nn.BCEWithLogitsLoss()  # Loss
 
-    # Prepare discriminator, loss, and optimizer
-    D = SmallDiscriminator(in_ch=3, base=64).to(device)
-    opt = torch.optim.Adam(D.parameters(), lr=2e-4)
-    bce = nn.BCEWithLogitsLoss()
-
-    # Train for a few epochs (short, since it's a test, not a full GAN)
-    for epoch in range(args.disc_epochs):
+    for epoch in range(args.disc_epochs):  # Short training
         pbar = tqdm(real_loader, desc=f"Disc epoch {epoch+1}/{args.disc_epochs}")
         for x_real, _ in pbar:
-            x_real = x_real.to(device)
-            # Generate a batch of fake samples
+            x_real = x_real.to(device)  # Real batch
             with torch.no_grad():
+                bs = x_real.size(0)
                 y = None
                 if cfg['cond_mode'] == 'class':
-                    y = torch.randint(0, cfg['num_classes'], (x_real.size(0),), device=device)
-                x_fake = diffusion.sample(model, (x_real.size(0), 3, args.img_size, args.img_size),
-                                          y=y, guidance_scale=args.guidance_scale)
-            # Labels: real=1, fake=0
-            y_real = torch.ones(x_real.size(0), device=device)
-            y_fake = torch.zeros(x_real.size(0), device=device)
+                    y = torch.randint(0, cfg['num_classes'], (bs,), device=device)
+                x_fake = diffusion.sample(model, (bs, 3, args.img_size, args.img_size),
+                                          y=y, guidance_scale=args.guidance_scale)  # Fake batch
+            y_real = torch.ones(bs, device=device)  # Labels real=1
+            y_fake = torch.zeros(bs, device=device)  # Labels fake=0
+            logits_real = D(x_real)  # Discriminate real
+            logits_fake = D(x_fake.detach())  # Discriminate fake
+            loss = 0.5 * (bce(logits_real, y_real) + bce(logits_fake, y_fake))  # Average loss
+            opt.zero_grad(set_to_none=True); loss.backward(); opt.step()  # Update
 
-            # Update with real batch
-            logits_real = D(x_real)
-            loss_real = bce(logits_real, y_real)
-
-            # Update with fake batch
-            logits_fake = D(x_fake.detach())
-            loss_fake = bce(logits_fake, y_fake)
-
-            # Combine and step
-            loss = (loss_real + loss_fake) * 0.5
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            opt.step()
-
-            pbar.set_postfix(loss=float(loss))
-
-    # Evaluate discriminator accuracy on a held-out set of mixed real/fake
-    D.eval()
-    tot, correct = 0, 0
+    # Evaluate accuracy on mixed real/fake
+    D.eval(); tot, correct = 0, 0
     with torch.no_grad():
         for x_real, _ in tqdm(real_loader, desc="Evaluating D"):
-            x_real = x_real.to(device)
-            bs = x_real.size(0)
-            # Half real, half fake
-            y_real = torch.ones(bs, device=device)
-            y_fake = torch.zeros(bs, device=device)
-            # Fake batch
+            x_real = x_real.to(device); bs = x_real.size(0)
+            y_real = torch.ones(bs, device=device); y_fake = torch.zeros(bs, device=device)
             y = None
             if cfg['cond_mode'] == 'class':
                 y = torch.randint(0, cfg['num_classes'], (bs,), device=device)
             x_fake = diffusion.sample(model, (bs, 3, args.img_size, args.img_size),
                                       y=y, guidance_scale=args.guidance_scale)
-
-            # Concatenate and predict
-            X = torch.cat([x_real, x_fake], dim=0)
-            Y = torch.cat([y_real, y_fake], dim=0)
-            logits = D(X)
-            pred = (torch.sigmoid(logits) > 0.5).float()
-            correct += (pred == Y).sum().item()
-            tot += Y.numel()
-    acc = correct / tot
-    print(f"Two-sample discriminator accuracy: {acc:.3f} (ideal ≈ 0.5 if distributions match)" )
+            X = torch.cat([x_real, x_fake], dim=0); Y = torch.cat([y_real, y_fake], dim=0)  # Mix
+            logits = D(X); pred = (torch.sigmoid(logits) > 0.5).float()  # Predictions
+            correct += (pred == Y).sum().item(); tot += Y.numel()  # Count
+    acc = correct / tot  # Accuracy
+    print(f"Two-sample discriminator accuracy: {acc:.3f} (ideal ≈ 0.5 if distributions match)")  # Report
 
 def parse_args():
     """Parse CLI for evaluation tasks."""
@@ -195,21 +164,14 @@ def parse_args():
     ap.add_argument('--img_size', type=int, default=64)
     ap.add_argument('--outdir', type=str, default='runs')
     ap.add_argument('--guidance_scale', type=float, default=1.0)
-
-    # For FID
-    ap.add_argument('--real_dir', type=str, default='')
-    ap.add_argument('--num_gen', type=int, default=5000)
-
-    # For two-sample
-    ap.add_argument('--disc_epochs', type=int, default=2)
-
-    # For sampling
-    ap.add_argument('--num_samples', type=int, default=64)
+    ap.add_argument('--real_dir', type=str, default='')  # For FID and two-sample
+    ap.add_argument('--num_gen', type=int, default=5000)  # For FID
+    ap.add_argument('--disc_epochs', type=int, default=2)  # For two-sample
+    ap.add_argument('--num_samples', type=int, default=64)  # For sampling
     return ap.parse_args()
 
 def main():
-    args = parse_args()
-    ensure_dir(args.outdir)
+    args = parse_args(); ensure_dir(args.outdir)  # Ensure outdir exists
     if args.task == 'sample':
         task_sample(args)
     elif args.task == 'fid':
@@ -223,3 +185,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
