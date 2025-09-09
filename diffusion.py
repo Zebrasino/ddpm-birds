@@ -81,5 +81,5 @@ class Diffusion:
             t = torch.full((shape[0],), t_step, device=self.device, dtype=torch.long)
             x = self.p_sample(model, x, t, y=y, guidance_scale=guidance_scale)
         return x
-PY
+
 
