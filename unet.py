@@ -96,7 +96,7 @@ class UNet(nn.Module):  # define class UNet
         self.up1 = nn.ConvTranspose2d(base * 4, base * 2, 2, stride=2)  # PyTorch operation
         self.up_block1 = ResBlock(base * 4, base * 2, t_dim, y_dim=num_classes)  # PyTorch operation
         self.up2 = nn.ConvTranspose2d(base * 2, base, 2, stride=2)  # PyTorch operation
-        self.up_block2 = ResBlock(base * 2, base, t_dim, y_dim=num_classes)  # PyTorch operation
+        self.up_block2 = ResBlock(base * 3, base, t_dim, y_dim=num_classes)  # PyTorch operation
         self.out_conv = nn.Conv2d(base, img_ch, 3, padding=1)  # PyTorch operation
 
     def forward(self, x: torch.Tensor, t: torch.Tensor, y: Optional[torch.Tensor] = None) -> torch.Tensor:  # define function forward
