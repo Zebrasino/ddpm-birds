@@ -1,5 +1,4 @@
-# Esegui in /content/ddpm-birds
-cat > diffusion.py <<'PY'
+
 # diffusion.py
 from __future__ import annotations
 from typing import Tuple, Optional
