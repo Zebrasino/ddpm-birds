@@ -1,152 +1,107 @@
-# train.py
-# Training loop for DDPM with UNet + EMA, AMP, and periodic sampling.
-# Designed to run on Colab T4 with moderate VRAM.
+import argparse  # import modules
+import os  # import modules
+import torch  # import modules
+from torch import optim  # import names from module
+from torch.utils.data import DataLoader  # import names from module
+from torchvision import transforms  # import names from module
+from torchvision.utils import save_image  # import names from module
 
-import os
-import argparse
-from typing import Optional
-
-import torch
-import torch.nn.functional as F
-from torch import optim
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
-
-from unet import UNet
-from diffusion import Diffusion
-from utils import EMA, ensure_dir, set_seed, save_grid
+from diffusion import Diffusion  # import names from module
+from unet import UNet  # import names from module
+from utils import set_seed, save_grid, EMAHelper  # import names from module
+from data import make_dataset  # import names from module
 
 
-def build_parser():
-    p = argparse.ArgumentParser()
-    p.add_argument("--data_root", type=str, required=True, help="ImageFolder root (subdirs=classes)")
-    p.add_argument("--outdir", type=str, required=True, help="Where to save checkpoints and samples")
-    p.add_argument("--img_size", type=int, default=64)
-    p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--epochs", type=int, default=40)
-    p.add_argument("--lr", type=float, default=2e-4)
-    p.add_argument("--ema_decay", type=float, default=0.999)
-    p.add_argument("--num_steps", type=int, default=400)
-    p.add_argument("--schedule", type=str, choices=["linear", "cosine"], default="cosine")
-    p.add_argument("--cond_mode", type=str, choices=["none", "class"], default="class")
-    p.add_argument("--num_classes", type=int, default=None)
-    p.add_argument("--p_uncond", type=float, default=0.1)
-    p.add_argument("--guidance_scale", type=float, default=3.5)
-    p.add_argument("--num_workers", type=int, default=2)
-    p.add_argument("--base", type=int, default=64, help="UNet base channels (keep 64 on T4)")
-    p.add_argument("--save_every", type=int, default=5, help="epochs between checkpoints")
-    p.add_argument("--sample_every", type=int, default=5, help="epochs between sample grids")
-    p.add_argument("--seed", type=int, default=0)
-    return p
+def parse_args():  # define function parse_args
+    p = argparse.ArgumentParser()  # variable assignment
+    p.add_argument('--data_root', type=str, required=True)  # statement
+    p.add_argument('--outdir', type=str, required=True)  # statement
+    p.add_argument('--img_size', type=int, default=64)  # statement
+    p.add_argument('--batch_size', type=int, default=16)  # statement
+    p.add_argument('--epochs', type=int, default=40)  # statement
+    p.add_argument('--lr', type=float, default=2e-4)  # statement
+    p.add_argument('--num_steps', type=int, default=400)  # statement
+    p.add_argument('--schedule', type=str, default='cosine')  # statement
+    p.add_argument('--cond_mode', type=str, choices=['none','class'], default='class')  # statement
+    p.add_argument('--p_uncond', type=float, default=0.1)  # statement
+    p.add_argument('--guidance_scale', type=float, default=3.0)  # statement
+    p.add_argument('--base', type=int, default=64)  # statement
+    p.add_argument('--seed', type=int, default=42)  # statement
+    return p.parse_args()  # return value
 
 
-def main():
-    args = build_parser().parse_args()
-    set_seed(args.seed)
+def main():  # define function main
+    args = parse_args()  # variable assignment
+    os.makedirs(args.outdir, exist_ok=True)  # statement
+    set_seed(args.seed)  # statement
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ensure_dir(args.outdir)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')  # variable assignment
 
-    # ---------- dataset ----------
-    # ImageFolder expects: data_root/class_x/xxx.png
-    tfm = transforms.Compose([
-        transforms.Resize(args.img_size, interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.CenterCrop(args.img_size),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(0.5, 0.5),  # maps to [-1,1]
+    tfm = transforms.Compose([  # variable assignment
+        transforms.Resize(args.img_size),  # statement
+        transforms.CenterCrop(args.img_size),  # statement
+        transforms.RandomHorizontalFlip(),  # statement
+        transforms.ToTensor(),  # statement
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),  # maps to [-1,1]  # PyTorch operation
     ])
-    dset = datasets.ImageFolder(args.data_root, transform=tfm)
-    if args.cond_mode == "class" and args.num_classes is None:
-        args.num_classes = len(dset.classes)
 
-    loader = DataLoader(dset, batch_size=args.batch_size, shuffle=True,
-                        num_workers=args.num_workers, pin_memory=True, drop_last=True)
+    ds, num_classes = make_dataset(args.data_root, tfm)  # variable assignment
+    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)  # variable assignment
 
-    # ---------- model ----------
-    model = UNet(
-        img_channels=3,
-        base=args.base,                     # keep 64 for T4
-        ch_mult=(1, 2, 2, 4),               # 64, 128, 128, 256
-        attn_resolutions=(16,),             # attention at 16x16 only
-        num_res_blocks=2,                   # light but expressive
-        time_emb_dim=256,
-        num_classes=(args.num_classes if args.cond_mode == "class" else None),
-    ).to(device)
+    model = UNet(base=args.base, num_classes=(num_classes if args.cond_mode=='class' else None)).to(device)  # variable assignment
+    diffusion = Diffusion(T=args.num_steps, schedule=args.schedule, device=device)  # variable assignment
 
-    # EMA shadow model
-    ema = EMA(model, decay=args.ema_decay)
+    optim_ = optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9,0.999), weight_decay=0.01)  # variable assignment
+    scaler = torch.cuda.amp.GradScaler()  # variable assignment
+    ema = EMAHelper(mu=0.999)  # variable assignment
+    ema.register(model)  # statement
 
-    # optimizer
-    optim_ = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0, betas=(0.9, 0.999))
+    global_step = 0  # variable assignment
+    for epoch in range(args.epochs):  # loop
+        model.train()  # PyTorch operation
+        for batch in dl:  # loop
+            x = batch[0].to(device, non_blocking=True)  # PyTorch operation
+            y = batch[1].to(device, non_blocking=True) if (args.cond_mode=='class') else None  # PyTorch operation
 
-    # diffusion
-    diffusion = Diffusion(T=args.num_steps, schedule=args.schedule, device=device)
+            with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):  # context manager
+                loss = diffusion.p_losses(model, x, y=y, p_uncond=args.p_uncond)  # PyTorch operation
 
-    # AMP scaler (new API)
-    scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
+            optim_.zero_grad(set_to_none=True)  # PyTorch operation
+            scaler.scale(loss).backward()  # PyTorch operation
+            scaler.unscale_(optim_)  # PyTorch operation
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # PyTorch operation
+            scaler.step(optim_)  # PyTorch operation
+            scaler.update()  # PyTorch operation
 
-    # save config for reproducibility
-    torch.save({"train_args": vars(args)}, os.path.join(args.outdir, "train_args.pt"))
+            ema.update(model)  # statement
 
-    # training
-    global_step = 0
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        running = 0.0
-        for x, y in loader:
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True) if (args.cond_mode == "class") else None
+            if global_step % 500 == 0:  # control flow
+                print(f"step {global_step} loss {loss.item():.4f}")  # debug/print
+            global_step += 1  # variable assignment
 
-            with torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
-                loss = diffusion.p_losses(model, x, y=y, p_uncond=args.p_uncond)
+        # sampling at epoch end with EMA  # comment  # statement
+        model.eval()  # PyTorch operation
+        _backup = {k: v.detach().clone() for k, v in model.state_dict().items()}  # variable assignment
+        ema.copy_to(model)  # statement
+        with torch.no_grad(), torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):  # context manager
+            n = 36  # variable assignment
+            if args.cond_mode=='class':  # control flow
+                y_s = torch.randint(0, model.num_classes, (n,), device=device)  # PyTorch operation
+            else:  # control flow
+                y_s = None  # variable assignment
+            x_gen = diffusion.sample(model, img_size=args.img_size, n=n, y=y_s, guidance_scale=(args.guidance_scale if y_s is not None else 0.0))  # PyTorch operation
+            x_gen = (x_gen + 1) / 2.0  # PyTorch operation
+            save_grid(x_gen, os.path.join(args.outdir, f'samples_epoch_{epoch:03d}.png'), nrow=6)  # statement
+        model.load_state_dict(_backup, strict=False)  # PyTorch operation
 
-            scaler.scale(loss).backward()
-            scaler.step(optim_)
-            scaler.update()
-            optim_.zero_grad(set_to_none=True)
-            ema.update()
-
-            running += float(loss.detach())
-            global_step += 1
-
-        avg_loss = running / max(1, len(loader))
-        print(f"Epoch {epoch}/{args.epochs} - loss: {avg_loss:.4f}")
-
-        # sampling (with EMA weights for better quality)
-        if (epoch % args.sample_every) == 0:
-            model.eval()
-            ema.copy_to(model)
-            with torch.no_grad(), torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
-                n = 36
-                # choose labels if conditional
-                if args.cond_mode == "class":
-                    y_sample = torch.randint(0, args.num_classes, (n,), device=device)
-                    x_gen = diffusion.sample(model, args.img_size, n, y=y_sample, guidance_scale=args.guidance_scale)
-                else:
-                    x_gen = diffusion.sample(model, args.img_size, n, y=None, guidance_scale=1.0)
-            save_grid(x_gen, os.path.join(args.outdir, f"samples_epoch_{epoch:03d}.png"), nrow=6)
-
-        # checkpoint
-        if (epoch % args.save_every) == 0:
-            ckpt = {
-                "model": model.state_dict(),
-                "ema": ema.shadow,
-                "model_cfg": model.model_cfg,
-                "args": vars(args),
-            }
-            torch.save(ckpt, os.path.join(args.outdir, f"epoch_{epoch:03d}.ckpt"))
-            torch.save(ckpt, os.path.join(args.outdir, f"last.ckpt"))  # convenience
-
-    # final checkpoint
-    ckpt = {
-        "model": model.state_dict(),
-        "ema": ema.shadow,
-        "model_cfg": model.model_cfg,
-        "args": vars(args),
-    }
-    torch.save(ckpt, os.path.join(args.outdir, f"last.ckpt"))
+        # checkpoint  # comment  # statement
+        ckpt = {
+            'model': model.state_dict(),  # variable assignment
+            'ema': ema.shadow,  # variable assignment
+            'args': vars(args),  # variable assignment
+        }  # variable assignment
+        torch.save(ckpt, os.path.join(args.outdir, 'last.ckpt'))  # PyTorch operation
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':  # control flow
+    main()  # statement
