@@ -1,4 +1,4 @@
-impoimport math                             # math helpers
+import math                             # math helpers
 from typing import Optional             # typing
 import torch                            # torch core
 from torch import nn                    # neural modules
