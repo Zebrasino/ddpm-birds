@@ -1,11 +1,10 @@
-# Core deep learning libs # statement
-torch>=2.1 # statement
-torchvision>=0.16 # statement
+# Deep learning
+torch>=2.1            # PyTorch core
+torchvision>=0.16     # Vision ops & datasets
 
+# Metrics (FID/KID/Precision-Recall)
+torch-fidelity>=0.3.0 # For FID/KID/PRC computation
 
-# Metrics for FID/KID/PR (optional but recommended) # statement
-torch-fidelity>=0.3.0 # statement
-
-
-# Utilities # statement
-numpy # statement
+# Utilities
+numpy                 # Array utils
+Pillow                # Image IO

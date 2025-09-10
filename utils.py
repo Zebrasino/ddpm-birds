@@ -1,39 +1,39 @@
-import os  # import modules
-import random  # import modules
-import numpy as np  # import modules
-import torch  # import modules
-from torchvision.utils import save_image as _save_image  # import names from module
+import os  # OS utilities
+import random  # Python RNG
+import numpy as np  # NumPy RNG
+import torch  # PyTorch core
+from torchvision.utils import save_image as _save_image  # image grid saver
 
 
-def set_seed(seed: int):  # define function set_seed
-    random.seed(seed)  # statement
-    np.random.seed(seed)  # statement
-    torch.manual_seed(seed)  # statement
-    if torch.cuda.is_available():  # control flow
-        torch.cuda.manual_seed_all(seed)  # PyTorch operation
+def set_seed(seed: int):  # determinism helper
+    random.seed(seed)  # seed python rng
+    np.random.seed(seed)  # seed numpy rng
+    torch.manual_seed(seed)  # seed cpu torch
+    if torch.cuda.is_available():  # if cuda present
+        torch.cuda.manual_seed_all(seed)  # seed all gpus
 
 
-def save_grid(x: torch.Tensor, path: str, nrow: int = 8):  # define function save_grid
-    os.makedirs(os.path.dirname(path), exist_ok=True)  # statement
-    _save_image(x, path, nrow=nrow)  # statement
+def save_grid(x: torch.Tensor, path: str, nrow: int = 8):  # save a grid of images in [0,1]
+    os.makedirs(os.path.dirname(path), exist_ok=True)  # ensure dir exists
+    _save_image(x, path, nrow=nrow)  # write png
 
 
-class EMAHelper:  # define class EMAHelper
-    def __init__(self, mu=0.999):  # define function __init__
-        self.mu = mu  # variable assignment
-        self.shadow = None  # variable assignment
+class EMAHelper:  # simple Exponential Moving Average tracker
+    def __init__(self, mu=0.999):  # mu close to 1 → slower EMA
+        self.mu = float(mu)  # decay factor
+        self.shadow = None  # dict of parameter averages
 
-    def register(self, model):  # define function register
-        self.shadow = {name: p.clone().detach() for name, p in model.state_dict().items()}  # variable assignment
+    def register(self, model):  # initialize shadow from model
+        self.shadow = {name: p.clone().detach() for name, p in model.state_dict().items()}  # copy weights
 
-    def update(self, model):  # define function update
-        for name, p in model.state_dict().items():  # loop
-            assert name in self.shadow  # statement
-            new_average = (1.0 - self.mu) * p.detach() + self.mu * self.shadow[name]  # PyTorch operation
-            self.shadow[name] = new_average.clone()  # variable assignment
+    def update(self, model):  # update shadow after each step
+        for name, p in model.state_dict().items():  # iterate all tensors
+            assert name in self.shadow  # must exist
+            self.shadow[name] = (1.0 - self.mu) * p.detach() + self.mu * self.shadow[name]  # ema update
 
-    def copy_to(self, model):  # define function copy_to
-        state = model.state_dict()  # variable assignment
-        for name in state:  # loop
-            if name in self.shadow:  # control flow
-                state[name].copy_(self.shadow[name])  # PyTorch operation
+    def copy_to(self, model):  # load ema weights into model
+        state = model.state_dict()  # current weights
+        for name in state:  # iterate tensors
+            if name in self.shadow:  # if tracked
+                state[name].copy_(self.shadow[name])  # overwrite with ema
+
