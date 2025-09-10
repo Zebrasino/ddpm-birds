@@ -1,5 +1,4 @@
-%%bash
-cat > /content/ddpm-birds/data.py <<'PY'
+
 import os
 from typing import Tuple, List, Dict, Optional
 from PIL import Image
@@ -113,6 +112,6 @@ def make_imagefolder_dataset(root: str, transform, subset: Optional[int] = None,
         ds.targets = [s[1] for s in ds.samples]
     num_classes = len(ds.classes)
     return ds, num_classes
-PY
+
 
 
