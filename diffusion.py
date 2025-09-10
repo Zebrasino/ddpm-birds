@@ -9,7 +9,7 @@ Schedule = Literal["linear", "cosine"]  # schedule enum type
 class Diffusion(nn.Module):  # DDPM core
     def __init__(self, T: int = 400, schedule: Schedule = "cosine", device: Optional[torch.device] = None):  # ctor
         super().__init__()  # init parent
-        self.T_int = torch.tensor(int(T), dtype=torch.long)  # store steps as tensor
+        self.T = int(T)  # store diffusion steps as plain int (lighter than tensor)
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")  # choose device
 
         # ----- make beta schedule -----
@@ -49,15 +49,17 @@ class Diffusion(nn.Module):  # DDPM core
 
     def p_losses(self, model: nn.Module, x0: torch.Tensor, y: Optional[torch.Tensor] = None, p_uncond: float = 0.1) -> torch.Tensor:  # training loss
         b = x0.size(0)  # batch size
-        t = torch.randint(0, int(self.T_int.item()), (b,), device=x0.device)  # uniform timestep per sample
+        t = torch.randint(0, self.T, (b,), device=x0.device)  # uniform timestep per sample
         noise = torch.randn_like(x0)  # target noise
         x_t = self.q_sample(x0, t, noise)  # noised input
         use_cond = (getattr(model, "num_classes", None) is not None) and (y is not None)  # check conditioning
-        if use_cond and (torch.rand((), device=x0.device) < p_uncond):  # batch-level dropout of labels (CFG train)
-            y_in = None  # unconditional pass
-        else:  # otherwise
-            y_in = (y if use_cond else None)  # keep labels or None
-        eps_pred = model(x_t, t, y_in)  # predict noise
+        if use_cond:  # if model supports conditioning and labels are provided
+            mask = torch.rand(b, device=x0.device) < p_uncond  # per-sample dropout mask
+            y_in = y.clone()  # copy labels for safe in-place ops
+            y_in[mask] = -1  # mark dropped labels with -1 so ResBlock ignores them
+        else:  # unconditional model or no labels
+            y_in = None  # no labels used
+        eps_pred = model(x_t, t, y_in)  # predict noise given possibly dropped labels
         return F.mse_loss(eps_pred, noise)  # MSE on noise
 
     @torch.no_grad()  # no grad for sampling
@@ -74,9 +76,11 @@ class Diffusion(nn.Module):  # DDPM core
 
     @torch.no_grad()  # sampling loop
     def sample(self, model: nn.Module, n: int, img_size: int, y: Optional[torch.Tensor] = None, guidance_scale: float = 0.0) -> torch.Tensor:  # full sampling
-        model.eval()  # eval mode
-        x = torch.randn(n, 3, img_size, img_size, device=self.device)  # start from noise
-        for i in reversed(range(int(self.T_int.item()))):  # loop t=T-1..0
+        was_training = model.training  # remember if model was in training mode
+        model.eval()  # switch to eval for sampling
+        ch = getattr(getattr(model, "in_conv", None), "in_channels", 3)  # infer image channels
+        x = torch.randn(n, ch, img_size, img_size, device=self.device)  # start from noise with inferred channels
+        for i in reversed(range(self.T)):  # loop t=T-1..0
             t = torch.full((n,), i, device=self.device, dtype=torch.long)  # current timestep batch
             if guidance_scale > 0 and (y is not None):  # classifier-free guidance
                 eps_uc = model(x, t, None)  # unconditional prediction
@@ -91,6 +95,7 @@ class Diffusion(nn.Module):  # DDPM core
                 x = mean + torch.sqrt(var) * noise  # update x
             else:  # no guidance
                 x = self.p_sample(model, x, t, y)  # standard DDPM step
+        model.train(was_training)  # restore original training/eval mode
         return x.clamp(-1, 1)  # clamp to valid range
 
 

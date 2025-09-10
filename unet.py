@@ -26,8 +26,11 @@ class ResBlock(nn.Module):  # residual block with t & optional y cond
         self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)  # conv3x3 in→out
         self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)  # conv3x3 out→out
         self.emb = nn.Linear(t_dim, out_ch)  # linear for time embedding
-        self.norm1 = nn.GroupNorm(32, out_ch)  # GN after conv1
-        self.norm2 = nn.GroupNorm(32, out_ch)  # GN after conv2
+        g = min(32, out_ch)  # start with up to 32 groups
+        while out_ch % g != 0:  # ensure divisibility
+            g -= 1  # decrement until groups divide channels
+        self.norm1 = nn.GroupNorm(g, out_ch)  # GN after conv1 with dynamic groups
+        self.norm2 = nn.GroupNorm(g, out_ch)  # GN after conv2 with dynamic groups
         self.dropout = nn.Dropout(dropout)  # dropout
         self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()  # skip conv if channels differ
         self.y_embed = nn.Embedding(y_dim, out_ch) if y_dim is not None else None  # class embedding if conditional

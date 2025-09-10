@@ -84,7 +84,7 @@ def main():  # main entry
 
     # optimizer, scaler, ema, scheduler
     optim_ = optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9,0.999), weight_decay=args.weight_decay)  # AdamW
-    scaler = torch.amp.GradScaler("cuda")  # AMP scaler (new API)
+    scaler = torch.amp.GradScaler(device.type)  # AMP scaler for active device
 
     ema = EMAHelper(mu=args.ema_mu)  # EMA helper
     ema.register(model)  # initialize EMA

@@ -110,6 +110,7 @@ def make_imagefolder_dataset(root: str, transform, subset: Optional[int] = None,
     if subset is not None:
         ds.samples = ds.samples[:int(subset)]
         ds.targets = [s[1] for s in ds.samples]
+    ds.imgs = ds.samples  # keep imgs alias in sync with samples
     num_classes = len(ds.classes)
     return ds, num_classes
 
