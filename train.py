@@ -1,196 +1,218 @@
 # train.py
-# DDPM training script (class-conditional optional).
-# Uses the new torch.amp autocast/GradScaler API (no deprecation warnings).
-# Every line is commented for clarity.
+# Training script for (class-conditional or unconditional) DDPM on CUB.
+# Key features:
+#  - Stable dataloader defaults for Colab (num_workers=0)
+#  - AMP with compatible fallback
+#  - EMA
+#  - Cosine LR schedule
+#  - P2 loss + optional foreground (bbox) weighting
+#  - In-training DDIM preview (fast) with minimal overhead
+# Every logical line is commented.
 
-import argparse                                  # parse CLI flags
-import os                                        # filesystem utilities
-import contextlib                                # nullcontext for CPU autocast
-import torch                                     # PyTorch core
-import torch.nn as nn                            # neural network helpers
-from torch import amp                            # NEW API: torch.amp for autocast/scaler
-from torchvision.utils import save_image         # image grid saving
+import os
+import math
+import argparse
+import random
+from typing import Optional
 
-from unet import UNet                            # our U-Net ε-predictor
-from diffusion import Diffusion                  # DDPM scheduler + loss + sampler
-from data import (                               # dataset builders / loader
-    make_transforms,
-    make_cub_bbox_dataset,
-    make_loader,
-)
-from utils import (                              # misc training utilities
-    EMA,
-    seed_everything,
-    cosine_warmup_lr,
-    save_ckpt,
-    load_ckpt,
-)
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torchvision.utils import save_image
 
-# --------------------------
-# CLI arguments definition
-# --------------------------
+from diffusion import Diffusion
+from data import make_cub_bbox_dataset
+from unet import UNet
+
+
+# ---------- small EMA helper ----------
+class EMA:
+    """Exponential Moving Average for model weights."""
+    def __init__(self, model: nn.Module, mu: float = 0.999):
+        self.mu = mu                                      # decay
+        self.shadow = {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        for k, v in model.state_dict().items():
+            self.shadow[k].mul_(self.mu).add_(v.detach(), alpha=1.0 - self.mu)
+
+    @torch.no_grad()
+    def copy_to(self, model: nn.Module):
+        model.load_state_dict(self.shadow, strict=False)
+
+
+# ---------- AMP glue that works on PyTorch 1.13–2.x ----------
+def make_amp(device: str):
+    """Return (autocast_ctx_fn, GradScaler_or_None) appropriate for this runtime."""
+    scaler = None
+    if device == "cuda":
+        # prefer torch.amp if present
+        if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+            def ctx():
+                return torch.amp.autocast(device_type="cuda")
+            scaler = torch.amp.GradScaler("cuda") if hasattr(torch.amp, "GradScaler") else None
+            return ctx, scaler
+        else:
+            from torch.cuda.amp import autocast, GradScaler
+            def ctx():
+                return autocast()
+            scaler = GradScaler()
+            return ctx, scaler
+    # CPU path: nullcontext
+    from contextlib import nullcontext
+    return (lambda: nullcontext()), None
+
+
 def parse_args():
-    ap = argparse.ArgumentParser()                                        # create parser
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data_root", type=str, required=True)          # CUB_200_2011 root
+    ap.add_argument("--use_bbox", action="store_true")               # crop around bbox
+    ap.add_argument("--bbox_expand", type=float, default=1.0)        # bbox expansion
+    ap.add_argument("--subset", type=int, default=None)              # first K images
+    ap.add_argument("--class_limit", type=int, default=None)         # first N classes
 
-    # Data / I/O
-    ap.add_argument("--data_root", type=str, required=True)               # path to CUB_200_2011
-    ap.add_argument("--use_bbox", action="store_true")                    # crop to provided bbox
-    ap.add_argument("--bbox_expand", type=float, default=1.0)             # bbox expansion factor
-    ap.add_argument("--subset", type=int, default=None)                   # use only first N items
-    ap.add_argument("--class_limit", type=int, default=None)              # keep only first K classes
-    ap.add_argument("--outdir", type=str, required=True)                  # output directory
+    ap.add_argument("--outdir", type=str, required=True)             # output folder
+    ap.add_argument("--img_size", type=int, default=48)              # resolution
+    ap.add_argument("--batch_size", type=int, default=16)            # batch size
+    ap.add_argument("--epochs", type=int, default=999)               # dummy cap (we stop by steps)
+    ap.add_argument("--max_steps", type=int, default=12000)          # hard stop by steps
 
-    # Training hyper-parameters
-    ap.add_argument("--img_size", type=int, default=48)                   # training resolution
-    ap.add_argument("--batch_size", type=int, default=16)                 # batch size
-    ap.add_argument("--epochs", type=int, default=999)                    # max epochs (guard)
-    ap.add_argument("--max_steps", type=int, default=None)                # hard stop after N steps
-    ap.add_argument("--lr", type=float, default=2e-4)                     # base learning rate
-    ap.add_argument("--weight_decay", type=float, default=0.0)            # weight decay
-    ap.add_argument("--num_steps", type=int, default=200)                 # diffusion steps T
-    ap.add_argument("--schedule", type=str, default="cosine",             # beta schedule
-                    choices=["cosine", "linear"])
+    ap.add_argument("--lr", type=float, default=2e-4)                # learning rate
+    ap.add_argument("--weight_decay", type=float, default=0.0)       # wd if you want
 
-    # Conditioning / guidance
-    ap.add_argument("--cond_mode", type=str, default="none",              # enable class conditioning
-                    choices=["none", "class"])
-    ap.add_argument("--p_uncond", type=float, default=0.1)                # CFG dropout prob at train
-    ap.add_argument("--guidance_scale", type=float, default=0.0)          # preview guidance at sample
+    ap.add_argument("--num_steps", type=int, default=100)            # diffusion steps T
+    ap.add_argument("--schedule", type=str, default="cosine", choices=["cosine", "linear"])  # β schedule
 
-    # Model / EMA / misc
-    ap.add_argument("--base", type=int, default=64)                       # UNet base channels
-    ap.add_argument("--ema_mu", type=float, default=0.9995)               # EMA decay
-    ap.add_argument("--seed", type=int, default=0)                        # RNG seed
-    ap.add_argument("--resume", type=str, default=None)                   # checkpoint to resume
-    ap.add_argument("--log_every", type=int, default=200)                 # preview/sample frequency
+    ap.add_argument("--cond_mode", type=str, default="none", choices=["none", "class"])  # conditioning
+    ap.add_argument("--p_uncond", type=float, default=0.1)           # CFG dropout (training)
+    ap.add_argument("--base", type=int, default=96)                  # UNet base channels
+    ap.add_argument("--ema_mu", type=float, default=0.999)           # EMA decay
 
-    return ap.parse_args()                                                # return populated args
+    ap.add_argument("--seed", type=int, default=0)                   # reproducibility
+    ap.add_argument("--log_every", type=int, default=200)            # print/sample interval
+
+    # foreground loss weighting (1.0 = off)
+    ap.add_argument("--fg_weight", type=float, default=3.0)          # weight inside bbox
+
+    return ap.parse_args()
 
 
-# --------------------------
-# Main training entrypoint
-# --------------------------
+def set_seed(seed: int):
+    """Deterministic-ish runs for debugging."""
+    random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+
+
+def cosine_lr(step: int, max_steps: int, base_lr: float) -> float:
+    """Simple cosine schedule from step 0..max_steps."""
+    if max_steps <= 0:
+        return base_lr
+    cos = 0.5 * (1 + math.cos(math.pi * min(step, max_steps) / max_steps))
+    return base_lr * cos
+
+
 def main():
-    args = parse_args()                                                   # parse flags
-    device = "cuda" if torch.cuda.is_available() else "cpu"              # choose device
-    seed_everything(args.seed)                                            # reproducibility knobs
+    args = parse_args()
+    set_seed(args.seed)
 
-    # ---------- Build data ----------
-    tfm = make_transforms(args.img_size)                                  # Resize->CenterCrop->ToTensor->Norm
-    expand = args.bbox_expand if args.use_bbox else 1.0                   # expansion factor (1.0 = tight bbox)
-    ds, num_classes = make_cub_bbox_dataset(                              # dataset + #classes actually used
-        args.data_root, tfm, expand,
+    device = "cuda" if torch.cuda.is_available() else "cpu"          # pick device
+    amp_ctx, scaler = make_amp(device)                               # AMP ctx and scaler
+
+    # ----- Data -----
+    ds = make_cub_bbox_dataset(
+        root=args.data_root,
+        img_size=args.img_size,
+        use_bbox=args.use_bbox,
+        bbox_expand=args.bbox_expand,
         class_limit=args.class_limit,
         subset=args.subset,
     )
-    dl = make_loader(ds, args.batch_size, shuffle=True, num_workers=2)    # small num_workers for Colab stability
-
-    # ---------- Build model / opt / EMA / scheduler ----------
-    cond = (args.cond_mode == "class")                                    # whether class conditioning is active
-    model = UNet(                                                         # instantiate UNet
-        base=args.base,
-        num_classes=(num_classes if cond else None),
-    ).to(device)
-    opt = torch.optim.AdamW(                                              # AdamW optimizer
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
-    )
-    scaler = amp.GradScaler('cuda') if device == 'cuda' else None         # NEW API GradScaler (None on CPU)
-    ema = EMA(model, mu=args.ema_mu)                                      # exponential moving average
-    diffusion = Diffusion(                                                # DDPM scheduler and loss
-        T=args.num_steps, schedule=args.schedule, device=torch.device(device)
+    dl = DataLoader(
+        ds, batch_size=args.batch_size, shuffle=True,
+        num_workers=0, persistent_workers=False, pin_memory=False, drop_last=True
     )
 
-    # ---------- (Optional) resume ----------
-    global_step = 0                                                       # initialize step counter
-    if args.resume is not None and os.path.isfile(args.resume):           # if resume path exists
-        ckpt = load_ckpt(args.resume, map_location=device)                # load checkpoint dict
-        model.load_state_dict(ckpt["model"], strict=False)                # restore model weights (strict=False tolerant)
-        if ckpt.get("ema", None) is not None:                             # restore EMA shadow if present
-            ema.shadow = ckpt["ema"]                                      # assign shadow weights dictionary
-        global_step = int(ckpt.get("step", 0))                            # continue step count
-        print(f"[resume] loaded '{args.resume}' at step {global_step}")   # log resume info
+    # ----- Model -----
+    num_classes = None if args.cond_mode == "none" else (args.class_limit or 200)
+    model = UNet(base=args.base, num_classes=num_classes).to(device)  # ε-predictor
 
-    # ---------- Make sure outdir exists ----------
-    os.makedirs(args.outdir, exist_ok=True)                               # create output directory
+    # ----- Optimizer / EMA / Diffusion -----
+    opt = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    ema = EMA(model, mu=args.ema_mu)
+    diffusion = Diffusion(T=args.num_steps, schedule=args.schedule, device=torch.device(device))
 
-    # ---------- Training loop ----------
-    model.train()                                                         # set training mode
-    for epoch in range(args.epochs):                                      # epoch guard (often we stop via max_steps)
-        for x, y in dl:                                                   # iterate mini-batches
-            x = x.to(device, non_blocking=True)                           # move images to device
-            y = y.to(device, non_blocking=True) if cond else None         # move labels if conditional
+    os.makedirs(args.outdir, exist_ok=True)                           # out dir
 
-            # Per-step cosine LR with warmup (smooth & stable on small batches)
-            lr = cosine_warmup_lr(                                        # compute LR for this step
-                global_step, args.max_steps or 1_000_000, args.lr, warmup=200
-            )
-            for pg in opt.param_groups:                                   # apply LR to all param groups
-                pg["lr"] = lr
+    # ----- Training loop -----
+    step = 0
+    model.train()
+    while step < args.max_steps:
+        for batch in dl:
+            if step >= args.max_steps:
+                break
 
-            # Choose autocast context depending on device (null on CPU)
-            amp_ctx = amp.autocast('cuda', dtype=torch.float16) if device == 'cuda' else contextlib.nullcontext()
+            # batch can be (x, y, mask)
+            x, y, mask = batch
+            x = x.to(device)                                         # (B,3,H,W) in [-1,1]
+            y = None if (y is None) else torch.as_tensor(y, device=device, dtype=torch.long)
+            mask = mask.to(device)                                   # (B,1,H,W)
 
-            opt.zero_grad(set_to_none=True)                               # clear previous gradients
-            with amp_ctx:                                                 # mixed precision region
-                loss = diffusion.p_losses(                                # DDPM ε-MSE loss
-                    model, x, y=y, p_uncond=(args.p_uncond if cond else 0.0)
+            # update LR with cosine schedule
+            for g in opt.param_groups:
+                g["lr"] = cosine_lr(step, args.max_steps, args.lr)
+
+            # forward + loss (with AMP if available)
+            with amp_ctx():
+                loss = diffusion.p_losses(
+                    model, x, y=y, p_uncond=args.p_uncond,
+                    p2_gamma=0.5, p2_k=1.0,
+                    fg_mask=mask, fg_weight=args.fg_weight
                 )
 
-            # Backpropagation + optimizer step (with or without GradScaler)
-            if scaler is not None:                                        # CUDA: use GradScaler
-                scaler.scale(loss).backward()                             # scaled backward
-                scaler.unscale_(opt)                                      # unscale before clipping (best practice)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)   # gradient clipping for stability
-                scaler.step(opt)                                          # optimizer step (scaled)
-                scaler.update()                                           # update scaler
-            else:                                                         # CPU path: plain FP32
-                loss.backward()                                           # backprop
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)   # gradient clipping
-                opt.step()                                                # optimizer step
+            # backward (scaled if AMP)
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)                                  # so we can clip if desired
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
 
-            ema.update(model)                                             # update EMA shadow weights
+            opt.zero_grad(set_to_none=True)                           # zero grads fast
+            ema.update(model)                                         # update EMA
+            step += 1
 
-            # Light logging to stdout
-            if global_step % 100 == 0:                                    # print every 100 steps
-                print(f"step {global_step} | loss {loss.item():.4f} | lr {lr:.2e}")
+            # ----- Logging / quick preview -----
+            if step % args.log_every == 0 or step == 1:
+                print(f"step {step} | loss {loss.item():.4f} | lr {opt.param_groups[0]['lr']:.2e}")
+                # quick 4x4 grid using DDIM (fast & robust)
+                model.eval()
+                with torch.no_grad():
+                    x_gen = diffusion.sample_ddim(
+                        model, shape=(16, 3, args.img_size, args.img_size),
+                        y=None, steps=40, eta=0.1, guidance_scale=0.0, skip_first=10
+                    )
+                    x_vis = (x_gen.clamp(-1, 1) + 1) / 2
+                    save_image(x_vis, os.path.join(args.outdir, f"samples_epoch_{step//args.log_every:03d}.png"), nrow=4)
+                model.train()
 
-            # Periodic sampling preview (small grid, EMA weights)
-            if (global_step > 0) and (global_step % args.log_every == 0): # time to preview
-                model.eval()                                              # switch to eval
-                # Build a mirror model and load EMA to keep training model untouched
-                ema_model = UNet(base=args.base,                          # same architecture as training
-                                  num_classes=(num_classes if cond else None)).to(device)
-                ema.copy_to(ema_model)                                    # copy EMA weights into mirror
-                with torch.no_grad():                                     # no grad during sampling
-                    B = 16                                                # grid size (4×4)
-                    H = args.img_size                                     # resolution
-                    y_samp = None                                         # default: unconditional
-                    if cond:                                              # if model is conditional
-                        # uniform random labels in the kept class set (0..num_classes-1)
-                        y_samp = torch.randint(0, num_classes, (B,), device=device, dtype=torch.long)
-                    # Sample via DDPM ancestral sampler (CFG only if cond)
-                    x_gen = diffusion.sample(ema_model, (B, 3, H, H),
-                                             y=y_samp,
-                                             guidance_scale=(args.guidance_scale if cond else 0.0),
-                                             deterministic=False)
-                    grid = (x_gen.clamp(-1, 1) + 1) / 2                   # map to [0,1] for saving
-                    save_path = os.path.join(args.outdir, f"samples_epoch_{epoch:03d}.png")
-                    save_image(grid, save_path, nrow=4)                   # write preview grid
-                model.train()                                             # back to training mode
+    # ----- Save checkpoint (raw + EMA) -----
+    ckpt = {
+        "args": vars(args),                           # store hyper-params for eval
+        "model": model.state_dict(),                  # last weights
+        "ema": ema.shadow,                            # EMA weights
+        "step": step,
+    }
+    torch.save(ckpt, os.path.join(args.outdir, "last.ckpt"))
+    print("Saved checkpoint ->", os.path.join(args.outdir, "last.ckpt"))
 
-            global_step += 1                                              # advance global step
-            # Hard stop condition by steps (typical on Colab to limit time)
-            if args.max_steps is not None and global_step >= args.max_steps:
-                print("Reached max_steps, stopping training.")            # notify user
-                save_ckpt(os.path.join(args.outdir, "last.ckpt"),         # save final checkpoint
-                          model, ema, vars(args), global_step)
-                return                                                    # leave main()
 
-        # End of epoch: always save a checkpoint (allows resume later)
-        save_ckpt(os.path.join(args.outdir, "last.ckpt"),                 # save periodic checkpoint
-                  model, ema, vars(args), global_step)
-
-# Standard Python entrypoint: run training when executed as a script
 if __name__ == "__main__":
     main()
 

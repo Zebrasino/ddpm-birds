@@ -1,227 +1,180 @@
 # diffusion.py
-# Minimal, robust DDPM utilities:
-# - beta schedules (cosine / linear)
-# - q(x_t | x_0) forward process
-# - training loss with P2 weighting
-# - samplers: DDPM (ancestral & deterministic) and DDIM (with skip_first)
+# Schedules + training loss + samplers.
+# Adds:
+#  - P2 loss weighting (better high-t learning)
+#  - Foreground-weighted per-pixel loss (bbox mask)
+#  - DDPM (ancestral/deterministic) + DDIM with skip_first and eta
 # Every line is commented for clarity.
 
-from typing import Optional, Tuple               # typing helpers
-import torch                                    # PyTorch core
-import torch.nn.functional as F                 # functional ops
+from typing import Optional, Tuple
+import torch
+import torch.nn.functional as F
 
 
 def _cosine_alphas_bar(T: int, device: torch.device) -> torch.Tensor:
-    """Compute cosine cumulative alphas (Nichol & Dhariwal) on [0..T].
-    We sample at step centers for stability."""
-    # create T+1 time grid from 0 to 1 (inclusive)
-    s = 0.008                                     # small offset from paper
-    t = torch.linspace(0, T, T + 1, device=device) / T  # [0..1]
-    # cosine schedule for alpha_bar
-    alphas_bar = torch.cos((t + s) / (1 + s) * torch.pi / 2) ** 2
-    # normalize to start at 1.0 exactly
-    alphas_bar = alphas_bar / alphas_bar[0]
-    # return the *interval* values between steps: we need T values at half-steps
-    # alpha_bar_t is taken at grid[1:], but we keep the cumulative array for gathers.
-    return alphas_bar                              # shape [T+1]
+    """Compute Nichol&Dhariwal cosine cumulative alphas (alpha_bar) over 0..T."""
+    s = 0.008                                        # small offset for stability
+    t = torch.linspace(0, T, T + 1, device=device) / T  # normalized time grid
+    ab = torch.cos((t + s) / (1 + s) * torch.pi / 2) ** 2  # cos^2 schedule
+    ab = ab / ab[0].clamp(min=1e-8)                  # normalize so ab[0] == 1
+    return ab                                        # shape [T+1] (cumulative)
 
 
 def _linear_betas(T: int, device: torch.device) -> torch.Tensor:
-    """Classic linear schedule: small betas -> large betas."""
-    beta_start = 1e-4                               # lower bound
-    beta_end = 2e-2                                 # upper bound
-    betas = torch.linspace(beta_start, beta_end, T, device=device)  # [T]
-    return betas
+    """Classic linear beta schedule, small→large."""
+    beta_start, beta_end = 1e-4, 2e-2                # bounds from original DDPM
+    return torch.linspace(beta_start, beta_end, T, device=device)  # [T]
 
 
 class Diffusion:
-    """DDPM helper that stores schedules and provides training loss + samplers."""
+    """Small helper object that stores schedules and provides loss/samplers."""
     def __init__(self, T: int = 200, schedule: str = "cosine", device: torch.device = torch.device("cpu")):
-        super().__init__()                          # initialize object
-        self.T = int(T)                             # number of diffusion steps
-        self.device = device                        # device to keep buffers
+        self.T = int(T)                               # number of diffusion steps
+        self.device = device                          # default device for buffers
 
-        # ---- build schedule ----
-        if schedule == "cosine":                    # cosine (preferred)
-            ab = _cosine_alphas_bar(self.T, device) # cumulative ᾱ from t=0..T
-            # derive betas from ᾱ_t and ᾱ_{t-1}: β_t = 1 - ᾱ_t / ᾱ_{t-1}
-            self.alphas_bar = ab[1:].clamp(1e-8, 1-1e-8)            # ᾱ_t for t=1..T  (T values)
-            prev = ab[:-1].clamp(1e-8, 1-1e-8)                       # ᾱ_{t-1}
-            self.betas = (1.0 - (self.alphas_bar / prev)).clamp(1e-8, 0.999)  # [T]
-        elif schedule == "linear":                  # linear β
-            self.betas = _linear_betas(self.T, device)               # [T]
-            # cumulative ᾱ from β
-            alphas = 1.0 - self.betas                               # α_t
-            self.alphas_bar = torch.cumprod(alphas, dim=0)           # ᾱ_t
+        # Build schedule: betas, alphas, cumulative alpha_bar, and handy roots
+        if schedule == "cosine":
+            ab = _cosine_alphas_bar(self.T, device)   # cumulative ᾱ for 0..T
+            self.alphas_bar = ab[1:].clamp(1e-8, 1 - 1e-8)   # ᾱ_t for t=1..T
+            prev = ab[:-1].clamp(1e-8, 1 - 1e-8)             # ᾱ_{t-1}
+            self.betas = (1.0 - (self.alphas_bar / prev)).clamp(1e-8, 0.999)  # β_t
+        elif schedule == "linear":
+            self.betas = _linear_betas(self.T, device)       # β_t
+            self.alphas_bar = torch.cumprod(1.0 - self.betas, dim=0)  # ᾱ_t
         else:
-            raise ValueError(f"Unknown schedule: {schedule}")        # guard invalid
+            raise ValueError(f"Unknown schedule: {schedule}")
 
-        # ---- precompute a few commonly used buffers ----
-        self.alphas = 1.0 - self.betas                               # α_t
-        self.sqrt_alphas = torch.sqrt(self.alphas)                   # √α_t
+        self.alphas = 1.0 - self.betas                 # α_t
+        self.sqrt_alphas = torch.sqrt(self.alphas)     # √α_t
         self.sqrt_recip_alphas = torch.sqrt(1.0 / self.alphas)       # √(1/α_t)
         self.sqrt_alphas_bar = torch.sqrt(self.alphas_bar)           # √ᾱ_t
         self.sqrt_one_minus_alphas_bar = torch.sqrt(1.0 - self.alphas_bar)  # √(1-ᾱ_t)
 
-    # -------------------------------
-    # Forward process q(x_t | x_0)
-    # -------------------------------
+    # ---------- Forward process q(x_t|x_0) ----------
     def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Draw x_t ~ q(x_t | x_0) = N( √ᾱ_t x_0, (1-ᾱ_t)I ).
-        x0: (B,3,H,W), t: (B,) long in [0..T-1], noise: optional ε."""
-        if noise is None:                                            # if no external noise
-            noise = torch.randn_like(x0)                             # sample ε ~ N(0,I)
-        # gather per-sample scaling factors and match spatial dims via view
-        sqrt_ab = self.sqrt_alphas_bar[t].view(-1, 1, 1, 1)          # √ᾱ_t
-        sqrt_om = self.sqrt_one_minus_alphas_bar[t].view(-1, 1, 1, 1)  # √(1-ᾱ_t)
-        # combine x0 and noise
-        return sqrt_ab * x0 + sqrt_om * noise                        # x_t
+        """Sample x_t = √ᾱ_t x0 + √(1-ᾱ_t) ε  with ε~N(0,I)."""
+        if noise is None:                               # lazily sample noise
+            noise = torch.randn_like(x0)                # ε
+        s_ab = self.sqrt_alphas_bar[t].view(-1, 1, 1, 1)          # per-sample √ᾱ_t
+        s_om = self.sqrt_one_minus_alphas_bar[t].view(-1, 1, 1, 1) # per-sample √(1-ᾱ_t)
+        return s_ab * x0 + s_om * noise                 # noisy x_t
 
-    # --------------------------------
-    # Training loss with P2 weighting
-    # --------------------------------
+    # ---------- Training loss (P2 + optional foreground weighting) ----------
     def p_losses(
         self,
-        model,                                  # ε-predictor UNet
-        x0: torch.Tensor,                       # clean image batch
-        y: Optional[torch.Tensor] = None,       # class labels or None
-        p_uncond: float = 0.0,                  # batch-level CFG dropout prob
-        p2_gamma: float = 0.5,                  # P2 exponent γ (0.5 works well)
-        p2_k: float = 1.0,                      # P2 shift k (1.0 by default)
+        model,                                          # UNet predicting ε
+        x0: torch.Tensor,                               # clean batch
+        y: Optional[torch.Tensor] = None,               # labels or None
+        p_uncond: float = 0.0,                          # CFG dropout prob
+        p2_gamma: float = 0.5,                          # P2 exponent γ
+        p2_k: float = 1.0,                              # P2 offset k
+        fg_mask: Optional[torch.Tensor] = None,         # (B,1,H,W) mask in [0,1]
+        fg_weight: float = 1.0,                         # >1 emphasizes bbox region
     ) -> torch.Tensor:
-        """Compute MSE(ε̂, ε) weighted by P2 (Nichol & Dhariwal, 2021)."""
-        B = x0.size(0)                                              # batch size
-        # sample t ~ Uniform{0..T-1}
-        t = torch.randint(0, self.T, (B,), device=x0.device, dtype=torch.long)  # (B,)
-        # sample Gaussian noise
-        eps = torch.randn_like(x0)                                  # ε ~ N(0,I)
-        # produce a noised input x_t
-        x_t = self.q_sample(x0, t, eps)                             # x_t
+        B = x0.size(0)                                  # batch size
+        t = torch.randint(0, self.T, (B,), device=x0.device, dtype=torch.long)  # t~U{0..T-1}
+        eps = torch.randn_like(x0)                      # ε ~ N(0,I)
+        xt = self.q_sample(x0, t, eps)                  # produce x_t
 
-        # classifier-free guidance dropout (whole-batch toggle for safety)
-        y_in = None                                                 # default: unconditional
-        if (y is not None) and (p_uncond < 1.0):                    # if conditional training
-            # with prob (1-p_uncond) we keep labels for the entire batch
-            if torch.rand((), device=x0.device) > p_uncond:         # keep labels this step
-                y_in = y                                            # else leave as None
+        # Classifier-free guidance dropout (batch-wise for simplicity)
+        y_in = None                                     # unconditional by default
+        if (y is not None) and (torch.rand((), device=x0.device) > p_uncond):
+            y_in = y                                    # keep labels this step
 
-        # predict noise with the model
-        eps_pred = model(x_t, t, y_in)                              # ε̂(x_t, t, y)
+        eps_pred = model(xt, t, y_in)                   # predict ε̂(x_t, t, y)
 
-        # per-sample MSE (flatten spatial & channel dims)
-        mse_per = (eps - eps_pred).pow(2).flatten(1).mean(dim=1)    # (B,)
+        # Per-pixel squared error
+        se = (eps - eps_pred) ** 2                      # (B,3,H,W)
+        if fg_mask is not None:                         # if bbox mask is provided
+            if fg_mask.dim() == 3:                      # (B,H,W) → (B,1,H,W)
+                fg_mask = fg_mask.unsqueeze(1)
+            w_pix = 1.0 + (fg_weight - 1.0) * fg_mask   # 1 outside, fg_weight inside
+            se = se * w_pix                             # emphasize foreground
+        mse_per = se.flatten(1).mean(dim=1)             # per-sample MSE
 
-        # P2 weighting: w_t = (k + SNR(t))^{-γ}, SNR = ᾱ_t / (1-ᾱ_t)
+        # P2 weighting: w_t = (k + SNR(t))^{-γ},  SNR(t)=ᾱ_t/(1-ᾱ_t)
         snr_t = self.alphas_bar[t] / (1.0 - self.alphas_bar[t])     # (B,)
         w = (p2_k + snr_t).pow(-p2_gamma)                           # (B,)
 
-        # final weighted loss
-        loss = (w * mse_per).mean()                                 # scalar
-        return loss                                                 # return loss
+        return (w * mse_per).mean()                    # scalar loss
 
-    # --------------------------
-    # DDPM ancestral sampler
-    # --------------------------
+    # ---------- DDPM (ancestral / deterministic) ----------
     @torch.no_grad()
     def sample_ddpm(
         self,
-        model,                                      # ε-predictor UNet
-        shape: Tuple[int, int, int, int],           # (B,3,H,W)
-        y: Optional[torch.Tensor] = None,           # labels or None
-        guidance_scale: float = 0.0,                # CFG scale (0 = off)
-        deterministic: bool = False,                # sigma=0 if True
+        model,
+        shape: Tuple[int, int, int, int],
+        y: Optional[torch.Tensor] = None,
+        guidance_scale: float = 0.0,
+        deterministic: bool = False,
     ) -> torch.Tensor:
-        """Classic DDPM sampling x_T -> ... -> x_0."""
-        B, C, H, W = shape                           # unpack shape
-        x = torch.randn(B, C, H, W, device=self.device)  # start from noise
-        for i in reversed(range(self.T)):            # iterate t=T-1..0
-            t = torch.full((B,), i, device=self.device, dtype=torch.long)  # (B,)
-            # ε̂ conditional / unconditional for CFG
+        """DDPM x_T→…→x_0; deterministic=True sets sigma=0."""
+        B, C, H, W = shape
+        x = torch.randn(B, C, H, W, device=self.device)            # start from noise
+        for i in reversed(range(self.T)):
+            t = torch.full((B,), i, device=self.device, dtype=torch.long)
+            # Classifier-free guidance
             if guidance_scale > 0.0 and y is not None:
-                eps_c = model(x, t, y)               # conditional
-                eps_u = model(x, t, None)            # unconditional
-                eps = eps_u + guidance_scale * (eps_c - eps_u)  # combine
+                eps_c = model(x, t, y)                             # conditional
+                eps_u = model(x, t, None)                          # unconditional
+                eps = eps_u + guidance_scale * (eps_c - eps_u)
             else:
-                eps = model(x, t, y)                 # plain ε̂
-
-            # DDPM update: mean = 1/√α_t * (x_t - (β_t/√(1-ᾱ_t)) ε̂)
-            sra = self.sqrt_recip_alphas[i]          # √(1/α_t)
-            bt = self.betas[i]                       # β_t
-            somab = self.sqrt_one_minus_alphas_bar[i]  # √(1-ᾱ_t)
-            mean = sra * (x - (bt / somab) * eps)    # μ_t(x_t, ε̂)
-
+                eps = model(x, t, y)
+            sra = self.sqrt_recip_alphas[i]                        # √(1/α_t)
+            bt = self.betas[i]                                     # β_t
+            somab = self.sqrt_one_minus_alphas_bar[i]              # √(1-ᾱ_t)
+            mean = sra * (x - (bt / somab) * eps)                  # μ_t(x_t, ε̂)
             if i > 0:
-                # σ_t = √β_t for ancestral; or 0 for deterministic
-                sigma = (0.0 if deterministic else torch.sqrt(bt))
-                x = mean + sigma * torch.randn_like(x)     # sample next x_{t-1}
+                sigma = 0.0 if deterministic else torch.sqrt(bt)   # σ_t
+                x = mean + sigma * torch.randn_like(x)             # x_{t-1}
             else:
-                x = mean                                    # final step uses mean
-        return x                                            # in [-1,1], approximately
+                x = mean                                           # x_0
+        return x                                                   # ~[-1,1]
 
-    # --------------------------
-    # DDIM sampler (deterministic when eta=0)
-    # --------------------------
+    # ---------- DDIM (robust & fast) ----------
     @torch.no_grad()
     def sample_ddim(
         self,
-        model,                                      # ε-predictor
-        shape: Tuple[int, int, int, int],           # (B,3,H,W)
-        y: Optional[torch.Tensor] = None,           # labels or None
-        steps: int = 50,                            # DDIM steps
-        eta: float = 0.0,                           # 0 => deterministic
-        guidance_scale: float = 0.0,                # CFG scale
-        skip_first: int = 0,                        # skip earliest noisy steps
+        model,
+        shape: Tuple[int, int, int, int],
+        y: Optional[torch.Tensor] = None,
+        steps: int = 50,
+        eta: float = 0.0,
+        guidance_scale: float = 0.0,
+        skip_first: int = 0,
     ) -> torch.Tensor:
-        """DDIM sampling with optional truncation of earliest steps."""
-        B, C, H, W = shape                           # unpack shape
-        x = torch.randn(B, C, H, W, device=self.device)        # start from noise
-        # choose indices from (T-1 - skip_first) down to 0 inclusive
-        start = max(0, self.T - 1 - int(skip_first))            # clamp
+        """DDIM x_T→…→x_0 with optional truncation of very noisy initial steps."""
+        B, C, H, W = shape
+        x = torch.randn(B, C, H, W, device=self.device)            # x_T
+        start = max(0, self.T - 1 - int(skip_first))               # trim earliest steps
         idxs = torch.linspace(start, 0, steps, dtype=torch.long, device=self.device)
+        a_bar = self.alphas_bar                                    # ᾱ lookup
 
-        a_bar = self.alphas_bar                       # ᾱ_t lookup
-        for i, t in enumerate(idxs):                  # iterate chosen DDIM steps
-            t = int(t.item())                         # python int for gathers
-            tb = torch.full((B,), t, device=self.device, dtype=torch.long)  # (B,)
-
-            # ε̂ with guidance if requested
+        for i, t in enumerate(idxs):
+            t = int(t.item())
+            tb = torch.full((B,), t, device=self.device, dtype=torch.long)
+            # guidance
             if guidance_scale > 0.0 and y is not None:
-                eps_c = model(x, tb, y)               # conditional
-                eps_u = model(x, tb, None)            # unconditional
-                eps = eps_u + guidance_scale * (eps_c - eps_u)  # CFG combine
+                eps_c = model(x, tb, y)
+                eps_u = model(x, tb, None)
+                eps = eps_u + guidance_scale * (eps_c - eps_u)
             else:
-                eps = model(x, tb, y)                 # plain
-
-            at = a_bar[t]                             # ᾱ_t scalar
-            # predict x0 from current x_t and ε̂:   x0 = (x - √(1-ᾱ_t) ε̂)/√ᾱ_t
-            x0 = (x - torch.sqrt(1 - at) * eps) / torch.sqrt(at)
-
-            if i == len(idxs) - 1:                    # last step -> return x0
-                x = x0
+                eps = model(x, tb, y)
+            at = a_bar[t]
+            x0 = (x - torch.sqrt(1 - at) * eps) / torch.sqrt(at)   # predict x0
+            if i == len(idxs) - 1:
+                x = x0                                             # final step → x0
                 break
-
-            t_prev = int(idxs[i + 1].item())          # next target timestep
-            a_prev = a_bar[t_prev]                     # ᾱ_{t'}
-            # DDIM parameters
+            t_prev = int(idxs[i + 1].item())
+            a_prev = a_bar[t_prev]
             sigma = eta * torch.sqrt((1 - a_prev) / (1 - at) * (1 - at / a_prev))
-            dir_xt = torch.sqrt(a_prev) * x0           # deterministic direction
-            noise = sigma * torch.randn_like(x)        # optional noise if eta>0
+            dir_xt = torch.sqrt(a_prev) * x0
+            noise = sigma * torch.randn_like(x)
             x = dir_xt + torch.sqrt(1 - a_prev - sigma ** 2) * eps + noise
-        return x                                       # in [-1,1], approximately
+        return x                                                   # ~[-1,1]
 
-    # --------------
-    # Convenience API
-    # --------------
+    # ---------- Back-compat default ----------
     @torch.no_grad()
-    def sample(
-        self,
-        model,                                      # ε-predictor
-        shape: Tuple[int, int, int, int],           # (B,3,H,W)
-        y: Optional[torch.Tensor] = None,           # labels or None
-        guidance_scale: float = 0.0,                # CFG scale
-        deterministic: bool = False,                # DDPM sigma=0 if True
-    ) -> torch.Tensor:
-        """Default to DDPM sampler (kept for backward-compat in training previews)."""
-        return self.sample_ddpm(
-            model, shape, y=y, guidance_scale=guidance_scale, deterministic=deterministic
-        )
+    def sample(self, model, shape, y=None, guidance_scale: float = 0.0, deterministic: bool = False):
+        """Default sampler = DDPM (kept for training previews)."""
+        return self.sample_ddpm(model, shape, y=y, guidance_scale=guidance_scale, deterministic=deterministic)
