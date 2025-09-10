@@ -1,119 +1,126 @@
-import os                                      # filesystem
-from typing import Tuple, List, Dict, Optional # typing
-from PIL import Image                          # image IO
-from torchvision import datasets, transforms   # torchvision datasets/transforms
+# data.py
+# CUB-200-2011 loaders with bbox cropping and simple transforms.
+# Every line commented.
 
-# ---------- CUB helper readers ----------
+from typing import Tuple, Dict, List, Optional                        # typing
+import os                                                             # filesystem
+from PIL import Image                                                 # image IO
+import torch                                                          # torch
+from torch.utils.data import Dataset, DataLoader                      # dataset
+from torchvision import transforms as T                               # aug/resize
+
+# ----------------------------
+# CUB metadata readers
+# ----------------------------
 
 def _read_images_txt(root: str) -> Dict[int, str]:
-    """Parse CUB images.txt → dict {img_id: relative_path_inside_images/}."""
-    mp = {}                                                                          # accumulator
-    with open(os.path.join(root, "images.txt"), "r") as f:                           # open file
-        for line in f:                                                               # iterate lines
-            i, p = line.strip().split(" ", 1)                                        # split id + path (no 'images/' prefix)
-            mp[int(i)] = p                                                           # store mapping
-    return mp                                                                        # return dict
+    # Parse images.txt -> {image_id: relative_path}
+    p = os.path.join(root, "images.txt")                              # file path
+    table = {}                                                        # id->path
+    with open(p, "r") as f:                                           # open file
+        for line in f:                                                # iterate lines
+            idx, rel = line.strip().split()                           # "1 001.Black_footed_Albatross/Black_Footed_Albatross_0001_796111.jpg"
+            table[int(idx)] = rel                                     # store
+    return table                                                      # mapping
 
 def _read_bboxes_txt(root: str) -> Dict[int, Tuple[float, float, float, float]]:
-    """Parse CUB bounding_boxes.txt → dict {img_id: (x, y, w, h)}; convert to 0-based."""
-    mp = {}                                                                          # accumulator
-    with open(os.path.join(root, "bounding_boxes.txt"), "r") as f:                   # open file
-        for line in f:                                                               # iterate lines
-            i, x, y, w, h = line.strip().split()                                     # tokens
-            mp[int(i)] = (float(x) - 1.0, float(y) - 1.0, float(w), float(h))        # 0-based coords
-    return mp                                                                        # return dict
+    # Parse bounding_boxes.txt -> {image_id: (x,y,w,h)}
+    p = os.path.join(root, "bounding_boxes.txt")                      # file path
+    table = {}                                                        # id->bbox
+    with open(p, "r") as f:                                           # open
+        for line in f:                                                # iterate
+            i, x, y, w, h = line.strip().split()                      # tokens
+            table[int(i)] = (float(x), float(y), float(w), float(h))  # store
+    return table                                                      # mapping
 
-class CUBBBoxDataset:
-    """
-    Dataset that crops each CUB image to its **ground-truth bounding box** (no extra expansion by default).
-    The dataset root must contain: images/ , images.txt , bounding_boxes.txt
-    """
-    def __init__(
-        self,
-        root: str,
-        transform,                               # torchvision transform pipeline
-        expand: float = 1.0,                     # **1.0 = exact bbox, no margin (per request)**
-        subset: Optional[int] = None,            # take only first N images
-        class_limit: Optional[int] = None        # keep only first K classes
-    ):
-        self.root = root                         # dataset root
-        self.transform = transform               # transform pipeline
-        self.expand = float(expand)              # expansion factor around bbox
-        self.images = _read_images_txt(root)     # id -> relative path (inside images/)
-        self.bboxes = _read_bboxes_txt(root)     # id -> bbox tuple
+def _read_image_class_labels(root: str) -> Dict[int, int]:
+    # Parse image_class_labels.txt -> {image_id: class_id}
+    p = os.path.join(root, "image_class_labels.txt")                  # file path
+    table = {}                                                        # mapping
+    with open(p, "r") as f:                                           # open
+        for line in f:                                                # iterate
+            i, c = line.strip().split()                               # tokens
+            table[int(i)] = int(c) - 1                                # 0-based class
+    return table                                                      # mapping
 
-        # Build class list from first path component (e.g., "001.Black_footed_Albatross/...")
-        classes = sorted({p.split("/")[0] for p in self.images.values()})            # unique class names
-        if class_limit is not None:                                                  # optionally limit classes
-            classes = classes[:int(class_limit)]
-        self.class_to_idx = {c: i for i, c in enumerate(classes)}                    # mapping name → label idx
+# ----------------------------
+# Dataset with bbox crop
+# ----------------------------
 
-        # Build sample list: (absolute_path, label_idx, img_id)
-        self.samples: List[Tuple[str, int, int]] = []
-        for img_id, rel in self.images.items():                                      # iterate all images
-            cls = rel.split("/")[0]                                                  # class name
-            if cls not in self.class_to_idx:                                         # skip if not selected
-                continue
-            label = self.class_to_idx[cls]                                           # label id
-            abs_path = os.path.join(root, "images", rel)                             # **join root + "images" + rel**
-            self.samples.append((abs_path, label, img_id))                           # store sample tuple
+class CUBBBoxDataset(Dataset):
+    # Reads CUB images, crops to bbox (optional expand), applies transforms.
+    def __init__(self, root: str, transform, expand: float = 1.0,
+                 class_limit: Optional[int] = None, subset: Optional[int] = None):
+        super().__init__()                                            # init
+        self.root = root                                              # dataset root
+        self.transform = transform                                    # torchvision transform
+        self.expand = expand                                          # bbox expansion factor
+        self.images = _read_images_txt(root)                          # id->relative path
+        self.bboxes = _read_bboxes_txt(root)                          # id->bbox
+        self.labels = _read_image_class_labels(root)                  # id->class (0..199)
 
-        if subset is not None:                                                       # limit dataset length
-            self.samples = self.samples[:int(subset)]
+        # Optionally filter classes (take first N by id)
+        if class_limit is not None:                                   # limit classes
+            keep = set(range(class_limit))                            # {0..class_limit-1}
+            self.items = [i for i in sorted(self.images.keys())
+                          if self.labels[i] in keep]                  # filter by class
+        else:
+            self.items = sorted(self.images.keys())                   # all ids
 
-    def __len__(self) -> int:
-        return len(self.samples)                                                     # dataset size
+        # Optionally reduce to a fixed subset size
+        if subset is not None:                                        # if subset requested
+            self.items = self.items[:subset]                          # take first K
 
-    def _crop_with_bbox(self, img: Image.Image, bbox) -> Image.Image:
-        """Crop PIL image to bbox, optionally expanding by self.expand (1.0 → exact box)."""
-        W, H = img.size                                                              # image size
-        x, y, w, h = bbox                                                            # bbox fields
-        cx, cy = x + w / 2.0, y + h / 2.0                                            # bbox center
-        # square side after expansion (max of w,h) — with expand=1.0 this equals the bbox size
-        side = max(w * self.expand, h * self.expand)
-        nx1 = max(0, int(cx - side / 2.0))                                           # left
-        ny1 = max(0, int(cy - side / 2.0))                                           # top
-        nx2 = min(W, int(cx + side / 2.0))                                           # right
-        ny2 = min(H, int(cy + side / 2.0))                                           # bottom
-        if (nx2 - nx1) < 8 or (ny2 - ny1) < 8:                                       # avoid degenerate crops
-            return img
-        return img.crop((nx1, ny1, nx2, ny2))                                        # crop and return
+    def __len__(self):
+        return len(self.items)                                        # dataset length
 
     def __getitem__(self, idx: int):
-        path, label, img_id = self.samples[idx]                                      # sample tuple
-        img = Image.open(path).convert("RGB")                                        # load RGB
-        bbox = self.bboxes.get(img_id, None)                                         # lookup bbox
-        if bbox is not None:                                                         # crop if available
-            img = self._crop_with_bbox(img, bbox)
-        if self.transform is not None:                                               # apply transforms
-            img = self.transform(img)
-        return img, label                                                            # return (tensor, label)
+        img_id = self.items[idx]                                      # integer id
+        rel = self.images[img_id]                                     # relative path
+        path = os.path.join(self.root, "images", rel)                 # full path
+        img = Image.open(path).convert("RGB")                         # load rgb
 
+        # Get bbox and crop (expand around center)
+        x, y, w, h = self.bboxes[img_id]                              # bbox floats
+        cx, cy = x + w/2, y + h/2                                     # center
+        w2, h2 = w*self.expand, h*self.expand                         # expanded size
+        # compute integer box ensuring image bounds
+        left   = max(0, int(cx - w2/2))
+        top    = max(0, int(cy - h2/2))
+        right  = min(img.width, int(cx + w2/2))
+        bottom = min(img.height, int(cy + h2/2))
+        img = img.crop((left, top, right, bottom))                    # crop to box
 
-def make_cub_bbox_dataset(root: str, transform, expand: float = 1.0, subset: Optional[int] = None, class_limit: Optional[int] = None):
-    """Factory: create CUB dataset with bbox cropping; returns (dataset, num_classes)."""
-    ds = CUBBBoxDataset(root, transform, expand=expand, subset=subset, class_limit=class_limit)
-    num_classes = len(ds.class_to_idx)
+        x = self.transform(img)                                       # apply transforms
+        y = self.labels[img_id]                                       # class label int
+        return x, y                                                   # sample
+
+# ----------------------------
+# Builders
+# ----------------------------
+
+def make_transforms(img_size: int):
+    # Deterministic transforms: resize → center-crop → normalize to [-1,1].
+    return T.Compose([
+        T.Resize(img_size, interpolation=T.InterpolationMode.BICUBIC),
+        T.CenterCrop(img_size),
+        T.ToTensor(),
+        T.Normalize((0.5,)*3, (0.5,)*3),
+    ])
+
+def make_cub_bbox_dataset(root: str, transform, expand: float,
+                          class_limit: Optional[int], subset: Optional[int]):
+    # Helper to build dataset + number of classes kept.
+    ds = CUBBBoxDataset(root, transform, expand=expand,
+                        class_limit=class_limit, subset=subset)
+    if class_limit is None:
+        num_classes = 200                                            # full CUB
+    else:
+        num_classes = class_limit                                    # restricted
     return ds, num_classes
 
-
-# --- Optional: plain ImageFolder for non-CUB folders (root must point to class subfolders) ---
-def make_imagefolder_dataset(root: str, transform, subset: Optional[int] = None, class_limit: Optional[int] = None):
-    """Factory: torchvision ImageFolder with optional class/size subset."""
-    ds = datasets.ImageFolder(root=root, transform=transform)                         # standard folder dataset
-    if class_limit is not None:                                                       # keep only first K classes
-        keep_classes = sorted(ds.classes)[:int(class_limit)]
-        keep_idx = [ds.class_to_idx[c] for c in keep_classes]
-        ds.samples = [s for s in ds.samples if s[1] in keep_idx]                      # filter samples
-        ds.targets = [s[1] for s in ds.samples]                                       # update targets
-        ds.classes = keep_classes                                                     # update class names
-    if subset is not None:                                                            # truncate dataset
-        ds.samples = ds.samples[:int(subset)]
-        ds.targets = [s[1] for s in ds.samples]
-    ds.imgs = ds.samples                                                              # keep alias consistent
-    num_classes = len(ds.classes)
-    return ds, num_classes                                                            # dataset + number of classes
-
-
-
+def make_loader(ds: Dataset, batch_size: int, shuffle: bool = True, num_workers: int = 2):
+    # Default small num_workers works on Colab/T4 without dataloader crashes.
+    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
+                      num_workers=num_workers, pin_memory=True, drop_last=True)
 

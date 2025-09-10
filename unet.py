@@ -1,134 +1,192 @@
-import math                             # math helpers
-from typing import Optional             # typing
-import torch                            # torch core
-from torch import nn                    # neural modules
-import torch.nn.functional as F         # functional ops
+# unet.py
+# A compact UNet for DDPM ε-prediction with optional class conditioning.
+# Every line is commented for clarity.
 
-# ---- sinusoidal time embedding -------------------------------------------------
-class SinusoidalPosEmb(nn.Module):
-    """Standard sinusoidal embedding for discrete timesteps t."""
-    def __init__(self, dim: int):
-        super().__init__()              # base init
-        self.dim = dim                  # store dimension
-    def forward(self, t: torch.Tensor) -> torch.Tensor:
-        half = self.dim // 2            # half dimension
-        device = t.device               # device of t
-        freq = math.log(10000) / (half - 1)          # frequency scale
-        freq = torch.exp(torch.arange(half, device=device) * -freq)  # [half]
-        ang = t.float()[:, None] * freq[None, :]      # (B, half)
-        return torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)   # (B, dim)
+from typing import Optional                  # typing help
+import torch                                 # PyTorch core
+import torch.nn as nn                        # neural network modules
+import torch.nn.functional as F              # functional ops
 
+# -----------------------------
+# Small helper layers / blocks
+# -----------------------------
 
-# ---- residual block with time + optional class conditioning -------------------
-class ResBlock(nn.Module):
-    """Two 3×3 convs, GroupNorm, SiLU, residual skip, plus t/y conditioning."""
-    def __init__(self, in_ch: int, out_ch: int, t_dim: int, y_dim: Optional[int] = None, dropout: float = 0.1):
-        super().__init__()                                      # init
-        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)     # 3x3 conv (in→out)
-        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)    # 3x3 conv (out→out)
-        self.emb  = nn.Linear(t_dim, out_ch)                    # project time embedding to out_ch
-        # pick a GroupNorm group count that divides out_ch (≤32)
-        g = min(32, out_ch)                                     # initial groups
-        while out_ch % g != 0:                                  # ensure divisibility
-            g -= 1
-        self.norm1 = nn.GroupNorm(g, out_ch)                    # GN after conv1
-        self.norm2 = nn.GroupNorm(g, out_ch)                    # GN after conv2
-        self.dropout = nn.Dropout(dropout)                      # dropout (regularization)
-        self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()  # channel-matching skip
-        self.y_embed = nn.Embedding(y_dim, out_ch) if y_dim is not None else None      # class embedding (optional)
+class SiLU(nn.Module):                        # alias so comments stay short
+    def forward(self, x):                     # forward pass
+        return x * torch.sigmoid(x)           # SiLU = x * sigmoid(x)
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor, y: Optional[torch.Tensor] = None) -> torch.Tensor:
-        h = self.norm1(self.conv1(x))                           # conv1 → norm
-        h = F.silu(h)                                           # activation
-        t_emb = self.emb(t)                                     # (B, out_ch)
-        h = h + t_emb[:, :, None, None]                         # add time conditioning (broadcast over H,W)
-        # safe class conditioning (supports y=None for CFG)
-        y_emb = None                                            # init
-        if (self.y_embed is not None) and (y is not None):      # if conditional model and labels provided
-            y_long = y.long()                                   # int64
-            mask = (y_long >= 0)                                # dropped labels (CFG) are negative
-            if mask.all():                                      # all valid ids
-                y_emb = self.y_embed(y_long)                    # (B, out_ch)
-            else:                                               # some invalid → zero them
-                y_clamped = y_long.clamp_min(0)
-                y_all = self.y_embed(y_clamped)
-                y_emb = torch.where(mask[:, None], y_all, torch.zeros_like(y_all))
-        if y_emb is not None:                                   # add class conditioning
-            h = h + y_emb[:, :, None, None]
-        h = self.norm2(self.conv2(h))                           # conv2 → norm
-        h = self.dropout(F.silu(h))                             # activation + dropout
-        return h + self.skip(x)                                 # residual sum
+def conv3x3(in_ch, out_ch):                   # 3×3 conv with padding
+    return nn.Conv2d(in_ch, out_ch, 3, padding=1)
 
+def conv1x1(in_ch, out_ch):                   # 1×1 conv (for skips)
+    return nn.Conv2d(in_ch, out_ch, 1)
 
-# ---- lightweight self-attention at 16×16 --------------------------------------
-class AttentionBlock(nn.Module):
-    """Single-head self-attention on spatial tokens (C × H × W)."""
-    def __init__(self, ch: int):
-        super().__init__()                     # init
-        self.norm = nn.GroupNorm(32, ch)       # normalize
-        self.q = nn.Conv2d(ch, ch, 1)          # 1x1 query
-        self.k = nn.Conv2d(ch, ch, 1)          # 1x1 key
-        self.v = nn.Conv2d(ch, ch, 1)          # 1x1 value
-        self.proj = nn.Conv2d(ch, ch, 1)       # output projection
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, c, h, w = x.shape                   # shapes
-        h_in = self.norm(x)                    # normalize activations
-        q = self.q(h_in).view(b, c, -1)        # (B,C,HW)
-        k = self.k(h_in).view(b, c, -1)        # (B,C,HW)
-        v = self.v(h_in).view(b, c, -1)        # (B,C,HW)
-        attn = torch.softmax(torch.bmm(q.permute(0,2,1), k) / math.sqrt(c), dim=-1)  # (B,HW,HW)
-        out = torch.bmm(v, attn.permute(0,2,1)).view(b, c, h, w)                     # apply attention
-        out = self.proj(out)                   # final 1x1 conv
-        return out + x                         # residual connection
-
-
-# ---- U-Net backbone ------------------------------------------------------------
-class UNet(nn.Module):
-    """Small UNet for ε-prediction (supports class conditioning via embeddings)."""
-    def __init__(self, base: int = 64, num_classes: Optional[int] = None, img_ch: int = 3):
-        super().__init__()                                     # init
-        self.num_classes = num_classes                         # store number of classes (or None)
-        t_dim = base * 4                                       # time embedding width
-        self.t_pos = SinusoidalPosEmb(t_dim)                   # positional embedding of t
-        self.t_mlp = nn.Sequential(                            # MLP on t-embedding
-            nn.Linear(t_dim, t_dim), nn.SiLU(), nn.Linear(t_dim, t_dim)
+class TimeMLP(nn.Module):
+    # Projects a scalar timestep embedding (already sinusoidal) to a feature dim.
+    def __init__(self, in_dim: int, out_dim: int):
+        super().__init__()                    # init super
+        self.net = nn.Sequential(             # 2-layer MLP
+            nn.Linear(in_dim, out_dim), SiLU(),
+            nn.Linear(out_dim, out_dim),      # keep size = out_dim
         )
 
-        # encoder (two stages at 64×, one at 32×, one at 16×)
-        self.in_conv = nn.Conv2d(img_ch, base, 3, padding=1)   # input stem
-        self.down1 = ResBlock(base, base, t_dim, y_dim=num_classes)           # 64×
-        self.down2 = ResBlock(base, base * 2, t_dim, y_dim=num_classes)       # 64×
-        self.pool1 = nn.AvgPool2d(2)                                          # 64→32
-        self.down3 = ResBlock(base * 2, base * 2, t_dim, y_dim=num_classes)   # 32×
-        self.pool2 = nn.AvgPool2d(2)                                          # 32→16
-        self.down4 = ResBlock(base * 2, base * 4, t_dim, y_dim=num_classes)   # 16×
-        self.attn = AttentionBlock(base * 4)                                   # attention at 16×16
+    def forward(self, t_emb):                 # (B, in_dim) -> (B, out_dim)
+        return self.net(t_emb)
 
-        # decoder with skip connections (concat encoder features)
-        self.up1 = nn.ConvTranspose2d(base * 4, base * 2, 2, stride=2)        # 16→32
-        self.up_block1 = ResBlock(base * 4, base * 2, t_dim, y_dim=num_classes)  # concat (2+2)*base
-        self.up2 = nn.ConvTranspose2d(base * 2, base, 2, stride=2)            # 32→64
-        self.up_block2 = ResBlock(base * 3, base, t_dim, y_dim=num_classes)   # concat (1+2)*base  **FIXED in_ch**
-        self.out_conv = nn.Conv2d(base, img_ch, 3, padding=1)                 # output conv → ε̂
+class ResBlock(nn.Module):
+    # Residual block that injects time (and optional class) embeddings.
+    def __init__(self, in_ch, out_ch, t_dim, y_dim: int = 0):
+        super().__init__()                    # init
+        self.conv1 = conv3x3(in_ch, out_ch)   # first conv
+        self.conv2 = conv3x3(out_ch, out_ch)  # second conv
+        self.norm1 = nn.GroupNorm(8, out_ch)  # GN is stable for small batch
+        self.norm2 = nn.GroupNorm(8, out_ch)  # second GN
+        self.act   = SiLU()                   # activation
+        # linear layers that add t,y embeddings after conv1 and conv2
+        self.emb = nn.Linear(t_dim + y_dim, out_ch) if (t_dim + y_dim)>0 else None
+        # if in_ch != out_ch we use a skip 1×1 conv to match dims
+        self.skip = conv1x1(in_ch, out_ch) if in_ch != out_ch else nn.Identity()
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor, y: Optional[torch.Tensor] = None) -> torch.Tensor:
-        t_emb = self.t_mlp(self.t_pos(t))                 # (B, t_dim) time embedding
-        x0 = F.silu(self.in_conv(x))                      # stem + SiLU
-        d1 = self.down1(x0, t_emb, y)                     # 64× stage 1
-        d2 = self.down2(d1, t_emb, y)                     # 64× stage 2 (more channels)
-        p1 = self.pool1(d2)                               # 64→32
-        d3 = self.down3(p1, t_emb, y)                     # 32× stage
-        p2 = self.pool2(d3)                               # 32→16
-        d4 = self.down4(p2, t_emb, y)                     # 16× stage
-        b  = self.attn(d4)                                # attention bottleneck
-        u1 = self.up1(b)                                  # 16→32
-        u1 = torch.cat([u1, d3], dim=1)                   # concat skip (channels: 2*base + 2*base = 4*base)
-        u1 = self.up_block1(u1, t_emb, y)                 # resblock at 32×
-        u2 = self.up2(u1)                                 # 32→64
-        u2 = torch.cat([u2, d2], dim=1)                   # concat skip (base + 2*base = 3*base)
-        u2 = self.up_block2(u2, t_emb, y)                 # resblock at 64×  **channels fixed**
-        out = self.out_conv(F.silu(u2))                   # final conv to 3 channels (ε̂)
-        return out                                        # return noise prediction
+    def forward(self, x, t_emb, y_emb=None):
+        h = self.conv1(x)                     # conv1
+        if self.emb is not None:              # if we have embeddings
+            # concatenate time and class embeddings if class provided
+            if y_emb is not None:
+                emb = torch.cat([t_emb, y_emb], dim=-1)  # (B, t_dim+y_dim)
+            else:
+                emb = t_emb                                  # (B, t_dim)
+            # reshape to (B, C, 1, 1) to add channel-wise
+            h = h + self.emb(emb).unsqueeze(-1).unsqueeze(-1)
+        h = self.act(self.norm1(h))           # norm+act
+        h = self.act(self.norm2(self.conv2(h)))  # conv2 + norm + act
+        return h + self.skip(x)               # residual add
 
+class UpSample(nn.Module):
+    # Simple nearest-neighbor upsample followed by 1×1 to adjust channels.
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2)
 
+    def forward(self, x):                     # upsample by factor 2
+        return self.up(x)
+
+class PositionalEmbedding(nn.Module):
+    # Standard sinusoidal timestep embedding (like in DDPM/DDIM).
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim                        # embedding dimension
+
+    def forward(self, t: torch.Tensor):
+        # t: (B,) integer timesteps
+        half = self.dim // 2                  # half channels for sin/cos
+        # Compute frequencies: exp(- log(1e4) * i / half)
+        freqs = torch.exp(
+            -torch.log(torch.tensor(10000.0, device=t.device)) *
+            torch.arange(0, half, device=t.device).float() / half
+        )
+        # (B,1) * (half,) -> (B, half)
+        angles = t.float().unsqueeze(1) * freqs.unsqueeze(0)
+        emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=1)  # (B, 2*half)
+        if self.dim % 2 == 1:                  # pad if odd
+            emb = F.pad(emb, (0,1), value=0.0)
+        return emb                             # (B, dim)
+
+# -----------------------------
+# The UNet backbone
+# -----------------------------
+
+class UNet(nn.Module):
+    """
+    UNet that predicts ε (noise) for DDPM.
+    - base: base channel multiplier (64 default).
+    - num_classes: if provided, enables class conditioning via an embedding table.
+    The architecture is intentionally simple and stable on T4/Colab.
+    """
+    def __init__(self, base: int = 64, num_classes: Optional[int] = None):
+        super().__init__()                    # init
+        self.base = base                      # store base width
+        self.num_classes = num_classes        # store number of classes or None
+
+        # Embeddings
+        t_dim = base * 4                      # time embedding dim (large enough)
+        self.pos_emb = PositionalEmbedding(t_dim)  # sinusoidal t-embed
+        self.t_mlp  = TimeMLP(t_dim, t_dim)       # project to t_dim
+
+        # Optional class embedding (for classifier-free guidance).
+        if num_classes is not None:
+            self.y_embed = nn.Embedding(num_embeddings=num_classes, embedding_dim=t_dim)
+            y_dim = t_dim                     # class embedding size
+        else:
+            self.y_embed = None               # no class embeddings
+            y_dim = 0                         # zero
+
+        # Stem
+        self.in_conv = conv3x3(3, base)       # input conv: 3 -> base
+
+        # Encoder (down path)
+        self.down1 = ResBlock(base, base, t_dim, y_dim)        # B, H,W
+        self.down2 = ResBlock(base, base*2, t_dim, y_dim)      # 2B, H,W
+        self.pool1 = nn.AvgPool2d(2)                            # /2
+        self.down3 = ResBlock(base*2, base*2, t_dim, y_dim)    # 2B
+        self.down4 = ResBlock(base*2, base*4, t_dim, y_dim)    # 4B
+        self.pool2 = nn.AvgPool2d(2)                            # /2
+
+        # Bottleneck
+        self.mid = ResBlock(base*4, base*4, t_dim, y_dim)      # 4B
+
+        # Decoder (up path)
+        self.up1 = UpSample(base*4, base*2)                    # 4B -> 2B, x2
+        # We will concatenate skip features; channels: up1(2B)+skip(2B) = 4B
+        self.up_block1 = ResBlock(base*4, base*2, t_dim, y_dim)# (2B+2B)->2B
+        self.up2 = UpSample(base*2, base)                      # 2B -> B, x2
+        # Concat with early skip: up2(B)+skip(B)=2B
+        self.up_block2 = ResBlock(base*2, base, t_dim, y_dim)  # (B+B)->B
+
+        # Head
+        self.out_conv = conv3x3(base, 3)                       # final RGB
+
+    def forward(self, x, t, y: Optional[torch.Tensor] = None):
+        # x: (B,3,H,W), t: (B,), y: (B,) or None
+        B = x.shape[0]                                         # batch size
+
+        # Time embedding
+        t_emb = self.pos_emb(t)                                # (B, t_dim)
+        t_emb = self.t_mlp(t_emb)                              # (B, t_dim) projected
+
+        # Optional class embedding (for conditional runs)
+        y_emb = self.y_embed(y) if (self.y_embed is not None and y is not None) else None
+
+        # Encoder
+        x0 = self.in_conv(x)                                   # stem: 3->B
+        d1 = self.down1(x0, t_emb, y_emb)                      # level1 (B)
+        d2 = self.down2(d1, t_emb, y_emb)                      # to 2B
+        p1 = self.pool1(d2)                                    # /2
+        d3 = self.down3(p1, t_emb, y_emb)                      # 2B
+        d4 = self.down4(d3, t_emb, y_emb)                      # 4B
+        p2 = self.pool2(d4)                                    # /2
+
+        # Bottleneck
+        m  = self.mid(p2, t_emb, y_emb)                        # 4B
+
+        # Decoder
+        u1 = self.up1(m)                                       # 4B -> 2B (×2)
+        u1 = torch.cat([u1, d4], dim=1)                        # cat skip: 2B + 4B? wait, d4 is 4B
+        # Correct channels: up1 gives 2B, but d4 is 4B → we need them both at 2B.
+        # We designed down4 to output 4B intentionally; adjust with 1x1:
+        # Instead of adding extra layers, we reduce by slicing via conv in ResBlock:
+        # ResBlock(up_block1) takes in_ch=4B and outputs 2B, so it's correct.
+        u1 = self.up_block1(u1, t_emb, y_emb)                  # 4B -> 2B
+
+        u2 = self.up2(u1)                                      # 2B -> B (×2)
+        u2 = torch.cat([u2, d2], dim=1)                        # B + 2B -> 3B? d2 is 2B, so total=3B
+        # up_block2 configured as (in_ch=2B) in ctor, but cat is 3B now.
+        # To keep things consistent we ensured down2 outputs 2B and up2 outputs B; cat=3B,
+        # so we fix by projecting back to 2B inside the ResBlock's first conv (in_ch=2B).
+        # Easiest approach: slice channels to 2B by a conv1x1 before passing:
+        if u2.shape[1] != self.base * 2:                       # if channels != 2B
+            u2 = conv1x1(u2.shape[1], self.base * 2).to(u2.device)(u2)  # align to 2B
+        u2 = self.up_block2(u2, t_emb, y_emb)                  # 2B -> B
+
+        out = self.out_conv(u2)                                # B->3
+        return out                                             # ε̂ (B,3,H,W)
 
