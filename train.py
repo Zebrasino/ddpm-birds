@@ -60,15 +60,13 @@ def main():  # main entry
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')  # pick device
 
     # transforms: zoom into the bird; normalize to [-1,1]
-    tfm = transforms.Compose([  # transform pipeline
-        transforms.RandomResizedCrop(  # crop-zoom
-            args.img_size, scale=(0.7, 1.0), ratio=(0.9, 1.1),
-            interpolation=transforms.InterpolationMode.BICUBIC
-        ),
-        transforms.RandomHorizontalFlip(),  # flip
-        transforms.ToTensor(),  # 0..1 tensor
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),  # [-1,1]
+    tfm = transforms.Compose([
+    transforms.Resize(args.img_size, interpolation=transforms.InterpolationMode.BICUBIC),
+    transforms.CenterCrop(args.img_size),
+    transforms.ToTensor(),
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
     ])
+
 
     # dataset: use bbox (CUB root) or imagefolder (images/)
     if args.use_bbox:  # using GT boxes
