@@ -5,8 +5,6 @@ __pycache__/
 .env
 .ipynb_checkpoints/
 *.log
-
-# Dati / output pesanti (NON su git)
 CUB_200_2011/
 data/
 runs/
