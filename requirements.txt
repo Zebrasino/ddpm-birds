@@ -1,10 +1,10 @@
-# Deep learning
+# Core DL
 torch>=2.1            # PyTorch core
-torchvision>=0.16     # Vision ops & datasets
+torchvision>=0.16     # Datasets/IO
 
-# Metrics (FID/KID/Precision-Recall)
-torch-fidelity>=0.3.0 # For FID/KID/PRC computation
+# Optional metrics
+torch-fidelity>=0.3.0 # FID/KID/Precision-Recall
 
 # Utilities
-numpy                 # Array utils
-Pillow                # Image IO
+numpy
+Pillow
