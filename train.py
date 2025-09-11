@@ -68,37 +68,43 @@ def make_amp(device: str):
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_root", type=str, required=True)          # CUB_200_2011 root
-    ap.add_argument("--use_bbox", action="store_true")               # crop around bbox
-    ap.add_argument("--bbox_expand", type=float, default=1.0)        # bbox expansion
-    ap.add_argument("--subset", type=int, default=None)              # first K images
-    ap.add_argument("--class_limit", type=int, default=None)         # first N classes
+    ap.add_argument("--use_bbox", action="store_true")               # crop around bbox if True
+    ap.add_argument("--bbox_expand", type=float, default=1.0)        # enlarge bbox by this factor
+    ap.add_argument("--subset", type=int, default=None)              # use only first K images (debug)
+    ap.add_argument("--class_limit", type=int, default=None)         # keep only first N classes
 
-    ap.add_argument("--outdir", type=str, required=True)             # output folder
-    ap.add_argument("--img_size", type=int, default=48)              # resolution
+    ap.add_argument("--outdir", type=str, required=True)             # output directory
+    ap.add_argument("--img_size", type=int, default=64)              # training resolution
     ap.add_argument("--batch_size", type=int, default=16)            # batch size
-    ap.add_argument("--epochs", type=int, default=999)               # dummy cap (we stop by steps)
-    ap.add_argument("--max_steps", type=int, default=12000)          # hard stop by steps
+    ap.add_argument("--epochs", type=int, default=999)               # dummy cap, we stop by steps
+    ap.add_argument("--max_steps", type=int, default=25000)          # stop after this many steps
 
-    ap.add_argument("--lr", type=float, default=2e-4)                # learning rate
-    ap.add_argument("--weight_decay", type=float, default=0.0)       # wd if you want
+    ap.add_argument("--lr", type=float, default=2e-4)                # base learning rate
+    ap.add_argument("--weight_decay", type=float, default=0.0)       # weight decay (optional)
 
-    ap.add_argument("--num_steps", type=int, default=100)            # diffusion steps T
-    ap.add_argument("--schedule", type=str, default="cosine", choices=["cosine", "linear"])  # β schedule
+    ap.add_argument("--num_steps", type=int, default=400)            # diffusion steps T
+    ap.add_argument("--schedule", type=str, default="cosine",
+                    choices=["cosine", "linear"])                    # beta schedule type
 
-    ap.add_argument("--cond_mode", type=str, default="none", choices=["none", "class"])  # conditioning
-    ap.add_argument("--p_uncond", type=float, default=0.1)           # CFG dropout (training)
+    ap.add_argument("--cond_mode", type=str, default="class",
+                    choices=["none", "class"])                       # conditioning mode
+    ap.add_argument("--p_uncond", type=float, default=0.3)           # classifier-free dropout prob
     ap.add_argument("--base", type=int, default=96)                  # UNet base channels
-    ap.add_argument("--ema_mu", type=float, default=0.999)           # EMA decay
+    ap.add_argument("--ema_mu", type=float, default=0.999)           # EMA decay factor
 
-    ap.add_argument("--seed", type=int, default=0)                   # reproducibility
-    ap.add_argument("--log_every", type=int, default=200)            # print/sample interval
+    ap.add_argument("--seed", type=int, default=0)                   # RNG seed
+    ap.add_argument("--log_every", type=int, default=250)            # log/sample every N steps
 
-    # foreground loss weighting (1.0 = off)
-    ap.add_argument("--fg_weight", type=float, default=3.0)          # weight inside bbox
-    ap.add_argument("--resume", type=str, default=None, help="Path to checkpoint .ckpt")
+    ap.add_argument("--fg_weight", type=float, default=5.0)          # loss weight inside bbox
 
+    # >>> NEW arguments <<<
+    ap.add_argument("--resume", type=str, default=None,              # path to a .ckpt to resume
+                    help="Path to checkpoint (.ckpt) to resume from")
+    ap.add_argument("--warmup", type=int, default=1000,              # warmup steps (0 = off)
+                    help="Number of linear warmup steps for the LR (0 disables)")
 
     return ap.parse_args()
+
 
 
 def set_seed(seed: int):
@@ -114,6 +120,28 @@ def cosine_lr(step: int, max_steps: int, base_lr: float) -> float:
         return base_lr
     cos = 0.5 * (1 + math.cos(math.pi * min(step, max_steps) / max_steps))
     return base_lr * cos
+    
+def cosine_warmup_lr(step: int, max_steps: int, base_lr: float, warmup: int = 0) -> float:
+    """Cosine decay with an initial linear warmup.
+
+    Args:
+        step:       current global step (0-based)
+        max_steps:  total training steps (used for cosine phase)
+        base_lr:    peak learning rate
+        warmup:     number of steps to warm up linearly from 0 -> base_lr
+    Returns:
+        float: learning rate for this step
+    """
+    # During warmup we ramp LR linearly from 0 to base_lr
+    if warmup and step < warmup:
+        return base_lr * float(step) / float(max(1, warmup))
+
+    # After warmup we run a cosine decay from base_lr -> 0
+    s = max(0, step - warmup)                        # shift step so cosine starts at 0
+    m = max(1, max_steps - warmup)                   # effective length of cosine phase
+    cos = 0.5 * (1 + math.cos(math.pi * min(s, m) / m))
+    return base_lr * cos
+
 
 
 def main():
@@ -148,8 +176,27 @@ def main():
 
     os.makedirs(args.outdir, exist_ok=True)                           # out dir
 
+	
+	start_step = 0                                       # default: start from scratch
+	if args.resume:
+    ckpt = torch.load(args.resume, map_location="cpu")  # load on CPU to be safe
+    # Load raw model weights (if present)
+    if "model" in ckpt:
+        model.load_state_dict(ckpt["model"], strict=False)
+    # Load EMA shadow weights (if present) so eval can use them right away
+    if "ema" in ckpt:
+        # Move EMA tensors to the current device
+        ema.shadow = {k: v.to(model.device if hasattr(model, "device") else next(model.parameters()).device)
+                      for k, v in ckpt["ema"].items()}
+        # If you prefer to *train from EMA weights*, uncomment the next line:
+        # ema.copy_to(model)
+    # Continue step count from the checkpoint (affects LR schedule)
+    start_step = int(ckpt.get("step", 0))
+    print(f"Resumed from {args.resume} @ step {start_step}")
+
+
     # ----- Training loop -----
-    step = 0
+	step = start_step                                   # continue from the resumed step
     model.train()
     while step < args.max_steps:
         for batch in dl:
@@ -162,9 +209,11 @@ def main():
             y = None if (y is None) else torch.as_tensor(y, device=device, dtype=torch.long)
             mask = mask.to(device)                                   # (B,1,H,W)
 
-            # update LR with cosine schedule
-            for g in opt.param_groups:
-                g["lr"] = cosine_lr(step, args.max_steps, args.lr)
+            # Update LR with cosine + (optional) warmup
+			lr_now = cosine_warmup_lr(step, args.max_steps, args.lr, warmup=args.warmup)
+			for g in opt.param_groups:
+				g["lr"] = lr_now
+
 
             # forward + loss (with AMP if available)
             with amp_ctx():
