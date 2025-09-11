@@ -203,14 +203,17 @@ def main():
     #   If fg_mask not available, we’ll handle it below.
     # -------------------------------------------------------------------------
     # Build dataset (only with supported arguments)
-    ds, num_classes = make_cub_bbox_dataset(
+    ds = make_cub_bbox_dataset(
         root=args.data_root,
         img_size=args.img_size,
         use_bbox=args.use_bbox,
-        bbox_expand=args.bbox_expand,   # works, present in your data.py
+        bbox_expand=args.bbox_expand,
         class_limit=args.class_limit,
         subset=args.subset,
     )
+    
+    num_classes = args.class_limit if args.class_limit else 200   # default to full CUB-200
+
 
 
 
