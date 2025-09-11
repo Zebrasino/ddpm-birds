@@ -17,5 +17,4 @@ cub*/
 *.tgz
 *.tar.gz
 *.zip
-*.ckpt
 runs/
