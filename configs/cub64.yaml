@@ -1,0 +1,44 @@
+# configs/cub64.yaml
+# Canonical 64×64 CUB training config used in the repo.
+# Every key mirrors a CLI flag in scripts/train.py so you can override from the command line.
+
+data_root: "/path/to/CUB_200_2011"   # Path to the CUB_200_2011 folder (contains images.txt, etc.)
+use_bbox: true                       # Crop around the bounding box and create a foreground mask
+bbox_expand: 1.5                     # Expand the bbox (1.0=no expand). 1.3–1.7 works well on CUB
+class_limit: null                    # Limit to first N classes (null = use all 200)
+subset: null                         # Debug: use first K images (null = full dataset)
+
+outdir: "outputs/cub64_b96_T400_fg5" # Where checkpoints and previews are written
+img_size: 64                         # Training resolution
+batch_size: 16                       # Global batch size
+epochs: 999                          # Not used for stopping; only for logs
+max_steps: 30000                     # Stop after this many optimization steps
+
+lr: 0.0002                           # Base learning rate (AdamW)
+weight_decay: 0.0                    # Optional weight decay
+
+num_steps: 400                       # Diffusion steps (T)
+schedule: "cosine"                   # Beta schedule: "cosine" or "linear"
+
+cond_mode: "class"                   # Conditioning: "class" or "none"
+p_uncond: 0.3                        # Classifier-free guidance dropout prob (during training)
+base: 96                             # UNet base channels (width). 64–128 reasonable
+ema_mu: 0.999                        # EMA decay factor (closer to 1.0 = slower)
+
+seed: 0                              # Random seed
+log_every: 250                       # Print loss and save a 4×4 DDIM preview every N steps
+fg_weight: 5.0                       # Loss multiplier inside bbox (foreground emphasis)
+
+resume: null                         # Optionally resume from a .ckpt path; null = start fresh
+warmup: 1000                         # LR warmup steps (0 disables)
+
+# ---- Optional default sampling settings (used by scripts/eval.py as a reference) ----
+sample:
+  sampler: "ddim"                    # "ddpm", "ddpm_det", or "ddim"
+  num_samples: 64                    # Number of images to sample in one shot
+  ddim_steps: 180                    # DDIM steps (trade-off speed/quality)
+  eta: 0.08                          # DDIM stochasticity (0.0 = deterministic)
+  skip_first: 60                     # Skip very noisy early steps (truncation trick)
+  guidance_scale: 2.3                # Classifier-free guidance scale (if conditional)
+  use_ema: true                      # Use EMA weights for sampling
+

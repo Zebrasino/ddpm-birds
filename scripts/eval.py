@@ -1,18 +1,13 @@
-# eval.py
-# Sampling/Eval script with:
-#  - DDPM (ancestral/deterministic) and DDIM
-#  - EMA option
-#  - CFG (for class-conditional models)
-#  - skip_first/eta controls for DDIM
-# Every line is commented.
-
-import argparse
-import os
-import torch
+import argparse, os, torch
 from torchvision.utils import save_image
 
-from unet import UNet
-from diffusion import Diffusion
+# Add ../src to sys.path so `ddpm_birds` imports work without installation
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
+
+from ddpm_birds import UNet, Diffusion
+
 
 
 def parse_args():

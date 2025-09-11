@@ -1,18 +1,17 @@
-import os                                           # filesystem utilities
-import math                                         # math.cos for cosine LR
-import argparse                                     # CLI argument parsing
-import random                                       # seeding Python RNG
-from typing import Optional                         # type hints (optional)
+import os, math, argparse, random
+import torch, torch.nn as nn, torch.optim as optim
+from torch.utils.data import DataLoader
+from torchvision.utils import save_image
 
-import torch                                        # main DL library
-import torch.nn as nn                               # neural network modules
-import torch.optim as optim                         # optimizers
-from torch.utils.data import DataLoader             # data loader
-from torchvision.utils import save_image            # save image grids
+# Allow running without installation: add ../src to sys.path
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
-from diffusion import Diffusion                     # diffusion utilities (loss + samplers)
-from data import make_cub_bbox_dataset              # CUB dataset factory (with bbox masks)
-from unet import UNet                               # ε-prediction UNet
+# Import from the package
+from ddpm_birds import Diffusion, make_cub_bbox_dataset, UNet
+from ddpm_birds import EMA, cosine_warmup_lr  # if you want to reuse these instead of local copies
+
 
 
 # ---------- small EMA helper ----------

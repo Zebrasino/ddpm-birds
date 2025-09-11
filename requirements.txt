@@ -1,5 +1,10 @@
-torch>=2.1
-torchvision>=0.16
-numpy
-Pillow
+# ========= Core =========
+numpy>=1.23
+Pillow>=9.5
+tqdm>=4.66
+PyYAML>=6.0
+scikit-learn>=1.2
+
+# ========= Metrics =========
 torch-fidelity>=0.3.0
+prdc>=0.2
