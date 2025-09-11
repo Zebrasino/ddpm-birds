@@ -54,29 +54,50 @@ def build_parser() -> argparse.ArgumentParser:
 # -----------------------------
 @torch.no_grad()
 def preview_samples(
-    model: UNet, diff: Diffusion, outdir: str, img_size: int, step: int,
-    cond_mode: str, num_classes: Optional[int], guidance_scale: float
+    model,                                   # UNet (EMA weights are OK)
+    diff,                                    # Diffusion object (has sample_ddim)
+    outdir: str,                             # folder where to save previews
+    img_size: int,                           # H=W of the preview samples
+    step: int,                               # current global training step (for filename)
+    cond_mode: str,                          # 'none' or 'class'
+    num_classes: Optional[int],              # number of classes (if class-conditional)
+    guidance_scale: float                    # CFG scale used at sampling
 ):
-    """Save a small grid of samples (DDIM 35 steps, eta=0) for quick visual feedback."""
-    model.eval()                                                      # eval mode
-    os.makedirs(outdir, exist_ok=True)                                # ensure dir
-    B = 16                                                            # grid size
-    shape = (B, 3, img_size, img_size)                                # tensor shape
+    """Save a 4x4 grid preview using DDIM (fast & stable)."""
+    model_was_training = model.training                    # remember current mode
+    model.eval()                                           # switch to eval for sampling
+    os.makedirs(outdir, exist_ok=True)                     # ensure output dir exists
 
-    # Choose labels for conditional model (random across seen classes)
-    y = None                                                          # default None
-    if cond_mode == "class" and num_classes is not None:              # conditional
-        y = torch.randint(0, num_classes, (B,), device=next(model.parameters()).device)  # random labels
+    B = 16                                                 # generate 16 images -> 4x4 grid
+    shape = (B, 3, img_size, img_size)                     # output tensor shape
+    device = next(model.parameters()).device               # infer device from model
 
-    # Use DDIM for fast previews
-    x = diff.sample_ddim(
-        model, shape, steps=35, eta=0.0, y=y,
-        guidance_scale=(guidance_scale if y is not None else 0.0),    # CFG only if conditional
-        skip_first=0
-    )
-    x = (x.clamp(-1, 1) + 1) / 2                                      # to [0,1]
-    save_image(x, os.path.join(outdir, f"preview_step_{step:06d}.png"), nrow=4)  # save grid
-    model.train()                                                     # back to train
+    # ---- Choose labels for conditional sampling (class-conditional case only)
+    y = None                                               # default: unconditional
+    if cond_mode == "class" and (num_classes is not None) and (num_classes > 0):
+        # Random class ids in [0, num_classes-1] so previews cover various classes.
+        y = torch.randint(0, num_classes, (B,), device=device)
+
+    # ---- Run DDIM sampler (deterministic if eta=0.0; small eta adds diversity)
+    with torch.no_grad():                                  # no gradients for sampling
+        x = diff.sample_ddim(                              # call your DDIM implementation
+            model=model,                                   # UNet (EMA suggested)
+            shape=shape,                                   # batch, channels, H, W
+            steps=35,                                      # 35 steps = quick but decent
+            eta=0.0,                                       # 0.0 = deterministic previews
+            y=y,                                           # None for unconditional, labels for conditional
+            guidance_scale=(guidance_scale if y is not None else 0.0),  # CFG only if conditional
+            skip_first=0                                   # do not skip initial steps
+        )
+
+    # ---- Convert from [-1,1] to [0,1] and save a 4x4 grid
+    x = (x.clamp(-1, 1) + 1) / 2                           # map to [0,1] for saving
+    out_path = os.path.join(outdir, f"preview_step_{step:06d}.png")
+    save_image(x, out_path, nrow=4)                        # write grid image
+
+    # ---- Restore original training/eval mode
+    model.train(model_was_training)                        # go back to previous mode
+                                            # back to train
 
 # -----------------------------
 # Main training
@@ -192,6 +213,23 @@ def main():
             # Logging each log_every
             if (step % args.log_every) == 0:                          # time to log
                 print(f"step {step} | loss {loss.item():.4f} | lr {opt.param_groups[0]['lr']:.2e}")
+                
+            # pick which weights to sample with: EMA if available, else raw model
+			model_for_preview = ema if ('ema' in globals() and ema is not None) else model
+
+			# decide when to preview
+			if (step == 1) or (step % args.preview_every == 0):
+				preview_samples(
+					model=model_for_preview,                # EMA gives cleaner previews
+					diff=diffusion,                         # your Diffusion instance
+					outdir=args.outdir,                     # same training output folder
+					img_size=args.img_size,                 # same resolution as training
+					step=step,                              # current global step
+					cond_mode=args.cond_mode,               # 'none' or 'class'
+					num_classes=getattr(ds, "num_classes", None),  # dataset attribute if present
+					guidance_scale=args.guidance_scale      # e.g., 3.5 for class-conditional
+				)
+
 
             # Periodic preview (fast DDIM samples)
             if args.preview_every and (step % args.preview_every == 0) and (step > 0):
