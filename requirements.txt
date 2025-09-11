@@ -1,10 +1,5 @@
-# Core DL
-torch>=2.1            # PyTorch core
-torchvision>=0.16     # Datasets/IO
-
-# Optional metrics
-torch-fidelity>=0.3.0 # FID/KID/Precision-Recall
-
-# Utilities
+torch>=2.1
+torchvision>=0.16
 numpy
 Pillow
+torch-fidelity>=0.3.0

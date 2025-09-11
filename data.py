@@ -1,182 +1,231 @@
-# data.py
-# CUB-200-2011 loader with bounding-box crops and a foreground mask.
-# Returns (image_tensor, label or None, fg_mask) so the loss can upweight the bird.
-# Every line is commented for clarity.
+from __future__ import annotations                # future annotations
+import os                                         # filesystem ops
+from typing import List, Tuple, Optional          # typing helpers
+import math                                       # math utilities
+import numpy as np                                # arrays
+from PIL import Image                             # image I/O
+import torch                                      # tensors
+from torch.utils.data import Dataset              # PyTorch dataset
+import torchvision.transforms as T                # transforms
+import torchvision.transforms.functional as TF    # functional transforms
 
-import os
-from typing import Optional, Tuple, List
+# -----------------------------
+# Small helpers to read CUB txt
+# -----------------------------
+def _read_lines(path: str) -> List[str]:
+    """Read a text file and return non-empty stripped lines."""
+    with open(path, "r") as f:                    # open file
+        lines = [ln.strip() for ln in f.readlines()]  # strip newline
+    return [ln for ln in lines if ln]             # drop empties
 
-import torch
-from torch.utils.data import Dataset
-from PIL import Image
-
-
-def _read_indexed_txt(path: str) -> List[Tuple[int, str]]:
-    """Read files like images.txt: 'idx path' per line → list of (idx, value)."""
-    out = []
-    with open(path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            idx_str, val = line.split(" ", 1)
-            out.append((int(idx_str), val))
-    return out
-
-
-def _load_cub_lists(root: str):
-    """Load CUB protocol files needed for bbox and class ids."""
-    images = _read_indexed_txt(os.path.join(root, "images.txt"))           # [(id, relpath)]
-    bboxes = _read_indexed_txt(os.path.join(root, "bounding_boxes.txt"))   # [(id, 'x y w h')]
-    labels = _read_indexed_txt(os.path.join(root, "image_class_labels.txt"))  # [(id, cls)]
-
-    # build id→path, id→(x,y,w,h), id→class
-    id_to_path = {i: os.path.join(root, "images", p) for i, p in images}
-    id_to_bbox = {}
-    for i, s in bboxes:
-        x, y, w, h = [float(v) for v in s.split()]
-        id_to_bbox[i] = (x, y, w, h)
-    id_to_cls = {i: int(c) - 1 for i, c in labels}  # to 0-based
-
-    return id_to_path, id_to_bbox, id_to_cls
-
-
-class CUBBBoxDataset(Dataset):
-    """CUB dataset that crops around bbox and returns a foreground mask.
-
-    root points to the CUB_200_2011 folder containing:
-      - images/...
-      - images.txt, bounding_boxes.txt, image_class_labels.txt
+def _load_cub_index(root: str):
     """
+    Parse CUB-200-2011 annotation files.
+    Returns dicts indexed by image_id (int starting at 1).
+    """
+    # Paths to official txt files shipped with the dataset
+    p_images   = os.path.join(root, "images.txt")                # id -> relative path
+    p_labels   = os.path.join(root, "image_class_labels.txt")    # id -> class id
+    p_bbox     = os.path.join(root, "bounding_boxes.txt")        # id -> bbox (x,y,w,h)
+    p_split    = os.path.join(root, "train_test_split.txt")      # id -> train(1)/test(0)
 
+    # Read all lines
+    lines_images = _read_lines(p_images)                         # e.g. "1 001.Black_footed_Albatross/Black_Footed_Albatross_0001_796111.jpg"
+    lines_labels = _read_lines(p_labels)                         # e.g. "1 1"
+    lines_bbox   = _read_lines(p_bbox)                           # e.g. "1 101 67 221 167"
+    lines_split  = _read_lines(p_split)                          # e.g. "1 1"
+
+    # Parse to dicts keyed by image id
+    id2path = {}                                                 # image id -> relative path under images/
+    id2label = {}                                                # image id -> class index (1..200)
+    id2bbox = {}                                                 # image id -> (x,y,w,h) in original image coords
+    id2train = {}                                                # image id -> is_train (bool)
+
+    for ln in lines_images:                                      # iterate entries
+        idx, rel = ln.split(" ", 1)                              # split id/path
+        id2path[int(idx)] = rel                                  # store mapping
+
+    for ln in lines_labels:                                      # iterate labels
+        idx, lab = ln.split(" ", 1)                              # id / class id (1..200)
+        id2label[int(idx)] = int(lab) - 1                        # convert to 0-based
+
+    for ln in lines_bbox:                                        # iterate bboxes
+        a = ln.split()                                           # id x y w h
+        idx = int(a[0])                                          # image id
+        x, y, w, h = map(float, a[1:])                           # bbox floats
+        id2bbox[idx] = (x, y, w, h)                              # store
+
+    for ln in lines_split:                                       # iterate split
+        idx, is_tr = ln.split(" ", 1)                            # id / 0|1
+        id2train[int(idx)] = (int(is_tr) == 1)                   # bool
+
+    return id2path, id2label, id2bbox, id2train                  # return dicts
+
+# -------------------------------------
+# Foreground mask from a bbox rectangle
+# -------------------------------------
+def _bbox_mask(h: int, w: int, x0: int, y0: int, x1: int, y1: int) -> torch.Tensor:
+    """
+    Build a binary mask 1 inside the (x0,y0,x1,y1) rectangle, 0 outside, shape (1,H,W).
+    Coordinates are clamped to [0,w]x[0,h].
+    """
+    # Clamp bounds to image
+    x0 = max(0, min(w, x0))                                      # clamp x0
+    y0 = max(0, min(h, y0))                                      # clamp y0
+    x1 = max(0, min(w, x1))                                      # clamp x1
+    y1 = max(0, min(h, y1))                                      # clamp y1
+
+    # Create zeros then fill the rectangle with ones
+    m = torch.zeros((1, h, w), dtype=torch.float32)              # (1,H,W) zeros
+    m[:, y0:y1, x0:x1] = 1.0                                     # set rectangle = 1
+    return m                                                     # binary mask
+
+# ---------------------------
+# The CUB dataset class
+# ---------------------------
+class CUBBBoxDataset(Dataset):
+    """
+    CUB dataset with optional bbox crop and mask.
+    Yields tuples: (image_tensor, class_label, fg_mask_tensor).
+    """
     def __init__(
         self,
-        root: str,                            # /content/CUB_200_2011
-        img_size: int = 48,                  # output resolution
-        use_bbox: bool = True,               # crop around bbox if True
-        bbox_expand: float = 1.0,            # expand/shrink bbox (1.0 = exact)
-        class_limit: Optional[int] = None,   # keep only first N classes (optional)
-        subset: Optional[int] = None,        # keep only first K images (optional)
-        normalize: bool = True,              # map to [-1,1]
+        root: str,                         # CUB_200_2011 directory (contains images/ + *.txt)
+        img_size: int = 64,                # final square size after transforms
+        use_bbox: bool = True,             # whether to crop around bbox
+        bbox_expand: float = 1.0,          # bbox expansion factor (>=1.0)
+        class_limit: Optional[int] = None, # limit number of classes (min 1)
+        subset: Optional[int] = None,      # limit number of images overall
+        train_only: bool = True,           # use only training split
     ):
-        super().__init__()
-        self.root = root
-        self.img_size = int(img_size)
-        self.use_bbox = bool(use_bbox)
-        self.bbox_expand = float(bbox_expand)
-        self.normalize = bool(normalize)
+        super().__init__()                                              # init dataset
+        self.root = root                                                # store root
+        self.img_size = img_size                                        # target size
+        self.use_bbox = use_bbox                                        # store flag
+        self.bbox_expand = bbox_expand                                  # expansion factor
 
-        id_to_path, id_to_bbox, id_to_cls = _load_cub_lists(root)   # protocol dicts
+        # Load mapping dicts from txts
+        id2path, id2label, id2bbox, id2train = _load_cub_index(root)    # parse metadata
 
-        # build list of ids obeying filters
-        ids = sorted(id_to_path.keys())
-        if class_limit is not None:
-            # keep ids with class in [0..class_limit-1]
-            ids = [i for i in ids if id_to_cls[i] < int(class_limit)]
-        if subset is not None:
-            ids = ids[: int(subset)]
+        # Build candidate image ids respecting train/test split
+        ids = [i for i in id2path.keys() if (id2train[i] if train_only else True)]  # keep train if requested
 
-        self.items = [(i, id_to_path[i], id_to_bbox.get(i, None), id_to_cls[i]) for i in ids]
+        # If class_limit is set, keep only those images whose label < class_limit
+        if class_limit is not None:                                      # if limiting classes
+            ids = [i for i in ids if id2label[i] < class_limit]          # filter ids
+
+        # Sort ids for reproducibility
+        ids.sort()                                                       # stable order
+
+        # If subset is set, keep only the first subset images
+        if subset is not None:                                           # if limiting images
+            ids = ids[:int(subset)]                                      # slice list
+
+        # Store resolved lists for fast indexing
+        self.ids = ids                                                   # final id list
+        self.id2path = id2path                                           # mappings
+        self.id2label = id2label
+        self.id2bbox = id2bbox
+
+        # Number of classes visible to the dataset (for class-conditional training)
+        self.num_classes = (class_limit if class_limit is not None else 200)  # default full 200
+
+        # Define base transforms (normalize to [-1,1])
+        self.to_tensor = T.Compose([                                     # compose transforms
+            T.ToTensor(),                                                # (H,W,C)[0..1] -> (C,H,W)
+            T.Normalize((0.5,)*3, (0.5,)*3),                             # to [-1,1]
+        ])
 
     def __len__(self) -> int:
-        return len(self.items)
-
-    def _crop_bbox(self, img: Image.Image, bbox_xywh):
-        """Crop around an expanded bbox, clamped to image bounds."""
-        if bbox_xywh is None:
-            return img                                   # no bbox → return whole image
-        W, H = img.size
-        x, y, w, h = bbox_xywh
-        # center + expanded box
-        cx, cy = x + w / 2.0, y + h / 2.0
-        scale = self.bbox_expand
-        w2, h2 = w * scale / 2.0, h * scale / 2.0
-        x0, y0 = max(0, int(cx - w2)), max(0, int(cy - h2))
-        x1, y1 = min(W, int(cx + w2)), min(H, int(cy + h2))
-        if x1 <= x0 or y1 <= y0:                         # degenerate → full image
-            return img
-        return img.crop((x0, y0, x1, y1))
+        """Return number of available images."""
+        return len(self.ids)                                             # dataset length
 
     def __getitem__(self, idx: int):
-        img_id, path, bbox, cls = self.items[idx]        # unpack index entry
+        """
+        Read one sample and return:
+        - x:     image tensor (3,H,W) normalized to [-1,1]
+        - y:     class label (int)
+        - fg:    foreground mask (1,H,W) in {0,1} (after resize to img_size)
+        """
+        # Resolve image id
+        img_id = self.ids[idx]                                           # image id
+        rel = self.id2path[img_id]                                       # relative path under images/
+        y = self.id2label[img_id]                                        # 0-based class index
 
-        # load PIL (RGB)
-        img = Image.open(path).convert("RGB")            # image at original size
+        # Load RGB image from disk
+        p_img = os.path.join(self.root, "images", rel)                   # absolute path
+        with Image.open(p_img) as im:                                    # open file
+            im = im.convert("RGB")                                       # ensure RGB
 
-        # (1) crop around bbox (if enabled)
-        if self.use_bbox:
-            img_c = self._crop_bbox(img, bbox)
-        else:
-            img_c = img
+            # Optional bbox-based crop (expand around center)
+            if self.use_bbox:                                            # if cropping enabled
+                x, y0, w, h = self.id2bbox[img_id]                       # original bbox floats
+                cx = x + w/2.0                                           # bbox center x
+                cy = y0 + h/2.0                                          # bbox center y
+                s  = max(w, h) * self.bbox_expand                        # square side after expansion
+                # Build square crop corners
+                left   = int(round(cx - s/2.0))                          # left x
+                top    = int(round(cy - s/2.0))                          # top y
+                right  = int(round(cx + s/2.0))                          # right x
+                bottom = int(round(cy + s/2.0))                          # bottom y
+                # Pad the image if the crop goes out-of-bounds
+                pad_l = max(0, -left)                                    # left pad
+                pad_t = max(0, -top)                                     # top pad
+                pad_r = max(0, right  - im.width)                        # right pad
+                pad_b = max(0, bottom - im.height)                       # bottom pad
+                if pad_l or pad_t or pad_r or pad_b:                     # if any pad needed
+                    im = TF.pad(im, (pad_l, pad_t, pad_r, pad_b), fill=0)# zero-pad
+                    left  += pad_l                                       # shift crop
+                    top   += pad_t
+                    right += pad_l
+                    bottom+= pad_t
+                # Finally crop to the square
+                im = im.crop((left, top, right, bottom))                 # perform crop
 
-        # we also create a foreground mask (1 inside bbox, 0 outside) AFTER resize
-        # build mask in original coords, then apply same crop+resize
-        if self.use_bbox and bbox is not None:
-            W, H = img.size
-            x, y, w, h = bbox
-            # expanded bbox rectangle (same as crop)
-            cx, cy = x + w / 2.0, y + h / 2.0
-            scale = self.bbox_expand
-            w2, h2 = w * scale / 2.0, h * scale / 2.0
-            x0, y0 = max(0, int(cx - w2)), max(0, int(cy - h2))
-            x1, y1 = min(W, int(cx + w2)), min(H, int(cy + h2))
+                # Foreground mask = all ones after bbox crop (whole patch is bird-focused)
+                fg = torch.ones(1, im.height, im.width, dtype=torch.float32)  # (1,H,W) ones
+            else:
+                # If we do not crop, we can build a rectangular mask aligned to the original image
+                x, y0, w, h = self.id2bbox[img_id]                       # bbox coords
+                # Convert to integer box corners
+                x0 = int(round(x))
+                y1 = int(round(y0 + h))
+                x1 = int(round(x + w))
+                y0 = int(round(y0))
+                fg = _bbox_mask(im.height, im.width, x0, y0, x1, y1)     # rectangle mask
 
-            # make a binary mask on the cropped window
-            import numpy as np
-            mask = Image.new("L", (img_c.size[0], img_c.size[1]), 0)
-            # bbox in the cropped frame (shift by x0,y0)
-            bx0, by0 = max(0, int(x - x0)), max(0, int(y - y0))
-            bx1, by1 = min(img_c.size[0], int(x + w - x0)), min(img_c.size[1], int(y + h - y0))
-            if bx1 > bx0 and by1 > by0:
-                from PIL import ImageDraw
-                draw = ImageDraw.Draw(mask)
-                draw.rectangle([bx0, by0, bx1, by1], fill=255)
-            # resize image and mask to model size
-            img_c = img_c.resize((self.img_size, self.img_size), resample=Image.BICUBIC)
-            mask = mask.resize((self.img_size, self.img_size), resample=Image.NEAREST)
-            # to tensors
-            x = torch.from_numpy((torch.ByteTensor(torch.ByteStorage.from_buffer(img_c.tobytes()))
-                                  .view(self.img_size, self.img_size, 3)
-                                  .numpy().astype("float32") / 255.0)).permute(2, 0, 1)
-            m = torch.from_numpy(
-                (torch.ByteTensor(torch.ByteStorage.from_buffer(mask.tobytes()))
-                 .view(self.img_size, self.img_size)
-                 .numpy().astype("float32") / 255.0)
-            ).unsqueeze(0)
-        else:
-            # simple resize (no bbox)
-            img_c = img_c.resize((self.img_size, self.img_size), resample=Image.BICUBIC)
-            import numpy as np
-            x = torch.from_numpy((torch.ByteTensor(torch.ByteStorage.from_buffer(img_c.tobytes()))
-                                  .view(self.img_size, self.img_size, 3)
-                                  .numpy().astype("float32") / 255.0)).permute(2, 0, 1)
-            m = torch.ones(1, self.img_size, self.img_size, dtype=torch.float32)
+            # Resize image and mask to target squared size (bicubic for image, nearest for mask)
+            im = im.resize((self.img_size, self.img_size), Image.BICUBIC)     # image resize
+            fg = TF.resize(fg, [self.img_size, self.img_size], interpolation=TF.InterpolationMode.NEAREST)  # mask resize
 
-        # normalize to [-1, 1]
-        if self.normalize:
-            x = x * 2.0 - 1.0
+            # Convert to normalized tensor
+            x = self.to_tensor(im)                                       # [-1,1] tensor
+            fg = fg.clamp(0, 1)                                          # safety clamp
 
-        return x, cls, m                                   # image, label (int), mask
+        return x, y, fg                                                  # return triplet
 
 
+# ---------------------------
+# Factory function
+# ---------------------------
 def make_cub_bbox_dataset(
     root: str,
     img_size: int,
-    use_bbox: bool,
-    bbox_expand: float,
-    class_limit: Optional[int],
-    subset: Optional[int],
-):
-    """Factory that returns the dataset configured for training/eval."""
-    ds = CUBBBoxDataset(
+    use_bbox: bool = True,
+    bbox_expand: float = 1.0,
+    class_limit: Optional[int] = None,
+    subset: Optional[int] = None,
+    train_only: bool = True,
+) -> CUBBBoxDataset:
+    """
+    Build and return a CUBBBoxDataset instance configured with the given options.
+    """
+    return CUBBBoxDataset(
         root=root,
         img_size=img_size,
         use_bbox=use_bbox,
         bbox_expand=bbox_expand,
         class_limit=class_limit,
         subset=subset,
-        normalize=True,
+        train_only=train_only,
     )
-    return ds
-
-

@@ -1,319 +1,221 @@
-# train.py — fully commented, line-by-line, with foreground-weighted loss support
+from __future__ import annotations                       # future annotations
+import os                                                # filesystem
+import argparse                                          # CLI parsing
+from typing import Optional                              # typing
 
-import os  # filesystem utilities
-import math  # for math helpers
-import argparse  # CLI argument parsing
-import random  # RNG for Python
-from pathlib import Path  # convenient path handling
-import time  # measure elapsed time
+import torch                                             # PyTorch
+from torch.utils.data import DataLoader                  # data loader
+from torchvision.utils import save_image                 # image saving
 
-import torch  # PyTorch main package
-import torch.nn as nn  # neural network building blocks
-import torch.optim as optim  # optimizers
-from torch.utils.data import DataLoader  # data loader
-from torch.cuda.amp import GradScaler, autocast  # mixed-precision tools
+from data import make_cub_bbox_dataset                   # dataset factory
+from unet import UNet                                    # model
+from diffusion import Diffusion                          # DDPM core
+from utils import EMA, seed_everything, cosine_warmup_lr, save_ckpt, load_ckpt  # utils
 
-from data import make_cub_bbox_dataset  # your dataset factory
-from unet import UNet  # the model (U-Net)
-from diffusion import Diffusion  # diffusion schedule + losses + samplers
-from utils import EMA  # exponential moving average helper (your utility)
+# AMP (use the cuda variant for widest compatibility on Colab)
+from torch.cuda.amp import autocast, GradScaler          # AMP autocast + scaler
 
-# ---------------------------
-# Small helpers
-# ---------------------------
-def set_seed(seed: int):
-    """Set all relevant random seeds for reproducibility."""
-    random.seed(seed)  # Python RNG
-    torch.manual_seed(seed)  # CPU RNG
-    torch.cuda.manual_seed_all(seed)  # GPU RNG
-    torch.backends.cudnn.deterministic = True  # deterministic convolution
-    torch.backends.cudnn.benchmark = False  # disable shape auto-tuning for determinism
+# -----------------------------
+# CLI
+# -----------------------------
+def build_parser() -> argparse.ArgumentParser:
+    """Define CLI arguments."""
+    p = argparse.ArgumentParser()                                    # parser
+    p.add_argument("--data_root", type=str, required=True, help="Path to CUB_200_2011 (folder with images/ and txts).")
+    p.add_argument("--use_bbox", action="store_true", help="Crop around bounding boxes.")
+    p.add_argument("--bbox_expand", type=float, default=1.0, help="Expansion factor for bbox crop (>=1).")
+    p.add_argument("--class_limit", type=int, default=None, help="Limit number of classes (<=200).")
+    p.add_argument("--subset", type=int, default=None, help="Limit number of images.")
+    p.add_argument("--img_size", type=int, default=64, help="Square resolution.")
+    p.add_argument("--outdir", type=str, required=True, help="Output directory for checkpoints and previews.")
+    p.add_argument("--batch_size", type=int, default=16, help="Batch size.")
+    p.add_argument("--epochs", type=int, default=50, help="Max epochs (used only if max_steps is None).")
+    p.add_argument("--max_steps", type=int, default=None, help="Stop after this many steps (preferred on Colab).")
+    p.add_argument("--lr", type=float, default=2e-4, help="Base learning rate.")
+    p.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay.")
+    p.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping value.")
+    p.add_argument("--num_steps", type=int, default=1000, help="Diffusion total timesteps T.")
+    p.add_argument("--schedule", type=str, choices=["cosine", "linear"], default="cosine", help="Beta schedule.")
+    p.add_argument("--cond_mode", type=str, choices=["none", "class"], default="none", help="Conditioning type.")
+    p.add_argument("--p_uncond", type=float, default=0.1, help="Classifier-free guidance drop prob during train.")
+    p.add_argument("--guidance_scale", type=float, default=0.0, help="CFG guidance scale for previews.")
+    p.add_argument("--base", type=int, default=64, help="UNet base width.")
+    p.add_argument("--ema_mu", type=float, default=0.9995, help="EMA decay.")
+    p.add_argument("--fg_weight", type=float, default=1.0, help="Foreground pixel weight multiplier in loss.")
+    p.add_argument("--log_every", type=int, default=200, help="Log frequency (steps).")
+    p.add_argument("--ckpt_every", type=int, default=2000, help="Checkpoint frequency (steps).")
+    p.add_argument("--preview_every", type=int, default=0, help="Preview sampling frequency (steps, 0=off).")
+    p.add_argument("--seed", type=int, default=0, help="Random seed.")
+    p.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from.")
+    return p                                                          # return parser
 
-def center_gaussian_mask(B, H, W, device, sigma=0.5):
-    """
-    Create a centered 2D Gaussian mask in [0,1] of shape (B,1,H,W).
-    sigma is expressed as a fraction of half-size; smaller sigma = sharper peak.
-    """
-    # Coordinate grid normalized to [-1, 1]
-    ys = torch.linspace(-1, 1, steps=H, device=device)  # y coordinates
-    xs = torch.linspace(-1, 1, steps=W, device=device)  # x coordinates
-    Y, X = torch.meshgrid(ys, xs, indexing="ij")  # 2D grid
-    # Gaussian radial profile
-    R2 = X**2 + Y**2  # squared radius
-    # Convert sigma (fraction) to variance in this normalized grid
-    var = (sigma**2)  # variance
-    mask2d = torch.exp(-0.5 * R2 / (var + 1e-8))  # Gaussian function
-    mask2d = (mask2d - mask2d.min()) / (mask2d.max() - mask2d.min() + 1e-8)  # normalize to [0,1]
-    return mask2d.unsqueeze(0).unsqueeze(0).repeat(B, 1, 1, 1)  # (B,1,H,W)
+# -----------------------------
+# Preview helper
+# -----------------------------
+@torch.no_grad()
+def preview_samples(
+    model: UNet, diff: Diffusion, outdir: str, img_size: int, step: int,
+    cond_mode: str, num_classes: Optional[int], guidance_scale: float
+):
+    """Save a small grid of samples (DDIM 35 steps, eta=0) for quick visual feedback."""
+    model.eval()                                                      # eval mode
+    os.makedirs(outdir, exist_ok=True)                                # ensure dir
+    B = 16                                                            # grid size
+    shape = (B, 3, img_size, img_size)                                # tensor shape
 
-# ---------------------------
-# Arg parser
-# ---------------------------
-def build_argparser():
-    """Create an argument parser with all training knobs."""
-    p = argparse.ArgumentParser(description="Train DDPM on CUB with optional class conditioning.")
+    # Choose labels for conditional model (random across seen classes)
+    y = None                                                          # default None
+    if cond_mode == "class" and num_classes is not None:              # conditional
+        y = torch.randint(0, num_classes, (B,), device=next(model.parameters()).device)  # random labels
 
-    # Data / I/O
-    p.add_argument("--data_root", type=str, required=True, help="Path to CUB_200_2011 root folder")
-    p.add_argument("--use_bbox", action="store_true", help="Use bounding boxes (crop around bird)")
-    p.add_argument("--bbox_expand", type=float, default=1.0, help="BBox expansion factor (>=1.0)")
-    p.add_argument("--class_limit", type=int, default=None, help="Limit number of classes (e.g., 200)")
-    p.add_argument("--subset", type=int, default=None, help="Limit number of images per class")
-    p.add_argument("--img_size", type=int, default=64, help="Training image size")
+    # Use DDIM for fast previews
+    x = diff.sample_ddim(
+        model, shape, steps=35, eta=0.0, y=y,
+        guidance_scale=(guidance_scale if y is not None else 0.0),    # CFG only if conditional
+        skip_first=0
+    )
+    x = (x.clamp(-1, 1) + 1) / 2                                      # to [0,1]
+    save_image(x, os.path.join(outdir, f"preview_step_{step:06d}.png"), nrow=4)  # save grid
+    model.train()                                                     # back to train
 
-    p.add_argument("--outdir", type=str, required=True, help="Output directory for checkpoints and logs")
-
-    # Optimization
-    p.add_argument("--batch_size", type=int, default=16, help="Batch size")
-    p.add_argument("--epochs", type=int, default=9999, help="Max epochs (used if max_steps not reached)")
-    p.add_argument("--max_steps", type=int, default=None, help="Stop after this many optimization steps")
-    p.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
-    p.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay for AdamW")
-    p.add_argument("--grad_clip", type=float, default=1.0, help="Gradient norm clipping threshold")
-
-    # Diffusion schedule
-    p.add_argument("--num_steps", type=int, default=300, help="Number of diffusion steps T")
-    p.add_argument("--schedule", type=str, choices=["cosine", "linear"], default="cosine",
-                   help="Beta schedule type")
-
-    # Conditioning
-    p.add_argument("--cond_mode", type=str, choices=["none", "class"], default="none",
-                   help="Conditioning mode (none or class)")
-    p.add_argument("--p_uncond", type=float, default=0.1,
-                   help="Classifier-free guidance training prob: drop condition with this prob")
-    p.add_argument("--guidance_scale", type=float, default=0.0,
-                   help="CFG guidance scale used only for in-training previews/sampling")
-
-    # Model
-    p.add_argument("--base", type=int, default=64, help="UNet base channel multiplier")
-
-    # EMA
-    p.add_argument("--ema_mu", type=float, default=0.999, help="EMA decay for model parameters")
-
-    # Logging / checkpoints
-    p.add_argument("--log_every", type=int, default=500, help="Log every N steps")
-    p.add_argument("--ckpt_every", type=int, default=2000, help="Save checkpoint every N steps")
-    p.add_argument("--seed", type=int, default=0, help="Random seed")
-    p.add_argument("--resume", type=str, default=None, help="Path to a checkpoint to resume from")
-    p.add_argument("--preview_every", type=int, default=0,
-                   help="If >0, run a quick sample preview every N steps")
-
-    # Foreground weighting (this is the reintroduced flag)
-    p.add_argument("--fg_weight", type=float, default=1.0,
-                   help="Extra weight for foreground pixels in the loss (>=1).")
-    p.add_argument("--fg_sigma", type=float, default=0.5,
-                   help="Sigma for center-gaussian mask if no mask is provided by the dataset.")
-
-    return p
-
-# ---------------------------
-# Main
-# ---------------------------
+# -----------------------------
+# Main training
+# -----------------------------
 def main():
-    """Main training routine."""
-    # Parse arguments
-    args = build_argparser().parse_args()  # parse all CLI arguments
+    args = build_parser().parse_args()                               # parse CLI
 
-    # Prepare output directory
-    outdir = Path(args.outdir)  # turn into Path object
-    outdir.mkdir(parents=True, exist_ok=True)  # create folder if not exists
+    seed_everything(args.seed)                                       # reproducibility
 
-    # Set random seeds for reproducibility
-    set_seed(args.seed)  # sync seeds
+    device = "cuda" if torch.cuda.is_available() else "cpu"          # pick device
+    torch.set_float32_matmul_precision("high")                       # speed hint
 
-    # Pick device
-    device = "cuda" if torch.cuda.is_available() else "cpu"  # choose GPU if available
+    os.makedirs(args.outdir, exist_ok=True)                          # ensure outdir
 
-    # Build dataset (returns a PyTorch Dataset)
-    # NOTE: make_cub_bbox_dataset returns a Dataset (not (ds, num_classes))
+    # Build dataset (train split only)
     ds = make_cub_bbox_dataset(
-        root=args.data_root,          # CUB root path
-        img_size=args.img_size,       # training resolution
-        use_bbox=args.use_bbox,       # crop around bbox if requested
-        bbox_expand=args.bbox_expand, # expand factor
-        class_limit=args.class_limit, # limit number of classes
-        subset=args.subset            # limit images per class
-    )
+        root=args.data_root,
+        img_size=args.img_size,
+        use_bbox=args.use_bbox,
+        bbox_expand=args.bbox_expand,
+        class_limit=args.class_limit,
+        subset=args.subset,
+        train_only=True,
+    )                                                                 # CUB dataset
 
-    # Infer number of classes if we are in class-conditional mode
-    if args.cond_mode == "class":
-        # Assumes the dataset exposes an attribute 'num_classes'
-        assert hasattr(ds, "num_classes"), "Dataset must have 'num_classes' attribute for class conditioning."
-        num_classes = ds.num_classes  # number of labels in the dataset
-    else:
-        num_classes = None  # unconditioned model
+    # Safety: ensure non-empty dataset
+    if len(ds) == 0:
+        raise RuntimeError(f"No training samples found. Check --data_root, split, class_limit, subset.")
 
-    # DataLoader for training
+    # DataLoader
     dl = DataLoader(
-        ds,                      # dataset
-        batch_size=args.batch_size,  # batch size
-        shuffle=True,                # shuffle data
-        num_workers=2,               # small number of workers (Colab-friendly)
-        pin_memory=True,             # faster host->device transfers
-        drop_last=True               # enforce full batches
-    )
+        ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=(device == "cuda"),
+        drop_last=True,
+    )                                                                 # data loader
 
-    # Create model
-    model = UNet(base=args.base, num_classes=num_classes).to(device)  # instantiate UNet
+    # Build model (conditional if requested)
+    num_classes = ds.num_classes if (args.cond_mode == "class") else None  # number of classes or None
+    model = UNet(base=args.base, num_classes=num_classes).to(device)  # UNet
 
-    # Exponential Moving Average wrapper
-    ema = EMA(model, mu=args.ema_mu)  # create EMA tracker
+    # Diffusion buffers
+    diffusion = Diffusion(T=args.num_steps, schedule=args.schedule, device=device)  # DDPM core
 
-    # Diffusion driver (schedule + forward training loss + samplers)
-    diffusion = Diffusion(
-        T=args.num_steps,            # number of diffusion steps
-        schedule=args.schedule,      # cosine or linear
-        device=torch.device(device)  # target device
-    )
-
-    # Optimizer: AdamW
-    optim_params = [p for p in model.parameters() if p.requires_grad]  # trainable params
-    opt = optim.AdamW(optim_params, lr=args.lr, weight_decay=args.weight_decay)  # optimizer
-
-    # AMP GradScaler for mixed precision stability
-    scaler = GradScaler()  # create scaler
+    # Optimizer / EMA / AMP scaler
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)  # AdamW
+    ema = EMA(model, mu=args.ema_mu)                                 # EMA tracker
+    scaler = GradScaler()                                             # AMP scaler
 
     # Optionally resume from checkpoint
-    global_step = 0  # count optimizer steps
-    start_epoch = 0  # starting epoch index
-    if args.resume is not None and os.path.isfile(args.resume):  # if a resume path exists
-        ckpt = torch.load(args.resume, map_location=device)  # load checkpoint
-        model.load_state_dict(ckpt["model"], strict=False)  # restore model weights (strict=False for safety)
-        if "ema" in ckpt:  # if EMA states are present
-            ema.shadow.load_state_dict(ckpt["ema"])  # restore EMA weights
-        if "opt" in ckpt:  # if optimizer state present
-            opt.load_state_dict(ckpt["opt"])  # restore optimizer
-        global_step = ckpt.get("global_step", 0)  # restore step count
-        start_epoch = ckpt.get("epoch", 0)  # restore epoch count
-        print(f"[resume] Loaded checkpoint from {args.resume} (step={global_step}, epoch={start_epoch})")  # log resume
+    start_step = 0                                                    # default
+    if args.resume is not None and os.path.isfile(args.resume):       # resume flag
+        ck = load_ckpt(args.resume, map_location=device)              # load dict
+        model.load_state_dict(ck["model"], strict=False)              # restore model
+        if ck.get("ema") is not None:                                 # restore EMA
+            ema.shadow.update(ck["ema"])
+        start_step = int(ck.get("step", 0))                           # continue step
 
-    # Training loop
-    t0 = time.time()  # start timer
-    for epoch in range(start_epoch, args.epochs):  # iterate over epochs
-        for batch in dl:  # iterate over batches
-            # Unpack batch; support (x,y) or (x,y,mask)
-            if isinstance(batch, (list, tuple)) and len(batch) == 3:
-                x, y, mask = batch  # dataset provided a mask tensor
-            elif isinstance(batch, (list, tuple)) and len(batch) == 2:
-                x, y = batch  # only image and label
-                mask = None   # no mask provided
-            else:
-                # If dataset returns only images (unconditional)
-                x = batch  # image tensor
-                y = None   # no labels
-                mask = None  # no mask
+    # Compute total training steps
+    if args.max_steps is not None:
+        total_steps = args.max_steps                                  # explicit stop
+    else:
+        steps_per_epoch = len(dl)                                     # batches per epoch
+        total_steps = steps_per_epoch * args.epochs                   # derive total
 
-            x = x.to(device, non_blocking=True)  # move images to device
-            if y is not None:
-                y = y.to(device, non_blocking=True)  # move labels to device
+    step = start_step                                                 # init counter
+    model.train()                                                     # train mode
 
-            # Build a center prior mask if no mask is present and fg_weight > 1
-            if mask is None and args.fg_weight > 1.0:
-                B, C, H, W = x.shape  # extract shapes
-                mask = center_gaussian_mask(B, H, W, device, sigma=args.fg_sigma)  # build center mask
-            elif mask is not None:
-                # Make sure mask has shape (B,1,H,W) and is float in [0,1]
-                if mask.dim() == 3:  # (B,H,W)
-                    mask = mask.unsqueeze(1)  # add channel dim
-                mask = mask.to(device, dtype=x.dtype)  # type & device
-                mask = mask.clamp(0, 1)  # clamp to [0,1]
+    while step < total_steps:                                         # training loop
+        for x, y, fg in dl:                                           # fetch batch (x: (B,3,H,W), y: int, fg: (B,1,H,W))
+            if step >= total_steps:                                   # safety stop
+                break
 
-            # Forward + loss under AMP autocast
-            opt.zero_grad(set_to_none=True)  # clear gradients
-            with autocast():  # enable mixed precision on CUDA automatically
-                # Compute DDPM loss; pass optional foreground mask + weight
-                loss = diffusion.p_losses(
-                    model,              # UNet
-                    x0=x,               # clean image
-                    y=y,                # labels (or None)
-                    p_uncond=args.p_uncond if args.cond_mode == "class" else 0.0,  # CFG drop prob
-                    mask=mask,          # optional foreground mask
-                    fg_weight=args.fg_weight  # extra weight for mask==1 pixels
-                )  # returns scalar loss
+            x = x.to(device, non_blocking=True)                       # move image
+            fg = fg.to(device, non_blocking=True)                     # move mask
 
-            # Backprop with AMP scaling
-            scaler.scale(loss).backward()  # backward pass (scaled)
-            if args.grad_clip is not None and args.grad_clip > 0:  # if gradient clipping enabled
-                scaler.unscale_(opt)  # unscale grads for clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)  # clip by norm
-            scaler.step(opt)  # optimizer step (scaled)
-            scaler.update()  # update scaler
+            # For unconditional training, ignore labels; for class-conditional,
+            # apply classifier-free guidance by dropping labels with prob p_uncond.
+            y_in = None                                               # default no labels
+            if args.cond_mode == "class":                             # conditional case
+                y = y.to(device, non_blocking=True)                   # move labels
+                if args.p_uncond > 0.0:                               # do CFG drop
+                    drop = torch.rand_like(y.float()) < args.p_uncond # mask of drops
+                    y_cf = y.clone()                                  # copy labels
+                    y_cf[drop] = -1                                   # -1 signals NULL to UNet
+                    y_in = y_cf                                       # use possibly-dropped labels
+                else:
+                    y_in = y                                          # use labels as-is
 
-            # Update EMA after optimizer step
-            ema.update(model)  # blend current weights into EMA shadow
+            # AMP autocast for forward/backward
+            with autocast(enabled=(device == "cuda")):                # mixed precision
+                loss = diffusion.p_losses(                             # compute loss
+                    model, x0=x, y=y_in, fg_mask=fg, fg_weight=args.fg_weight
+                )
 
-            # Increase global step
-            global_step += 1  # increment
+            opt.zero_grad(set_to_none=True)                           # clear grads
+            scaler.scale(loss).backward()                             # backprop in AMP
+            if args.grad_clip is not None:                            # optional clip
+                scaler.unscale_(opt)                                  # unscale first
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)  # clip
+            scaler.step(opt)                                          # optimizer step
+            scaler.update()                                           # update scaler
 
-            # Logging
-            if (global_step % args.log_every) == 0:  # periodic logging
-                elapsed = time.time() - t0  # seconds elapsed
-                print(f"step {global_step} | loss {loss.item():.4f} | lr {opt.param_groups[0]['lr']:.2e} | {elapsed/60:.1f} min")  # log line
+            # EMA update
+            ema.update(model)                                         # maintain shadow weights
 
-            # Optional preview sampling during training (lightweight DDIM)
-            if args.preview_every > 0 and (global_step % args.preview_every) == 0:  # if preview is requested
-                model_eval = ema.shadow  # use EMA for nicer samples
-                model_eval.eval()  # eval mode
-                with torch.no_grad():  # no grads
-                    # quick sample (deterministic DDIM, few steps)
-                    x_gen = diffusion.sample_ddim(
-                        model_eval,                    # model for sampling
-                        shape=(16, 3, args.img_size, args.img_size),  # sample grid
-                        steps=min(50, args.num_steps), # number of DDIM steps
-                        eta=0.0,                       # deterministic
-                        y=None,                        # unconditional preview
-                        guidance_scale=0.0             # no CFG here
-                    )  # returns (B,3,H,W) in [-1,1]
-                    # save preview grid
-                    from torchvision.utils import save_image  # lazy import
-                    grid = (x_gen.clamp(-1, 1) + 1) / 2.0  # to [0,1]
-                    save_image(grid, str(outdir / f"preview_step_{global_step:06d}.png"), nrow=4)  # write file
-                model_eval.train()  # back to train (for safety)
+            # Cosine LR with warmup
+            for g in opt.param_groups:                                # set LR per group
+                g["lr"] = cosine_warmup_lr(step, total_steps, args.lr, warmup=min(1000, total_steps//20))
+
+            # Logging each log_every
+            if (step % args.log_every) == 0:                          # time to log
+                print(f"step {step} | loss {loss.item():.4f} | lr {opt.param_groups[0]['lr']:.2e}")
+
+            # Periodic preview (fast DDIM samples)
+            if args.preview_every and (step % args.preview_every == 0) and (step > 0):
+                # Use EMA weights for prettier previews
+                shadow_model = UNet(base=args.base, num_classes=num_classes).to(device)  # temp model
+                shadow_model.load_state_dict(ema.shadow, strict=False)                   # load EMA
+                preview_samples(
+                    shadow_model, diffusion, args.outdir, args.img_size, step,
+                    args.cond_mode, num_classes, args.guidance_scale
+                )
 
             # Periodic checkpointing
-            if (global_step % args.ckpt_every) == 0:  # every N steps
-                ck = {
-                    "args": vars(args),        # store args
-                    "model": model.state_dict(),  # model weights
-                    "ema": ema.shadow.state_dict(),  # EMA weights
-                    "opt": opt.state_dict(),   # optimizer state
-                    "global_step": global_step,  # step count
-                    "epoch": epoch             # epoch count
-                }  # checkpoint dict
-                torch.save(ck, str(outdir / "last.ckpt"))  # save file
-                print(f"Saved checkpoint -> {outdir / 'last.ckpt'}")  # log path
+            if (step % args.ckpt_every) == 0 and (step > 0):          # save every N steps
+                save_ckpt(os.path.join(args.outdir, "last.ckpt"), model, ema, vars(args), step)
 
-            # Early stop on max_steps
-            if args.max_steps is not None and global_step >= args.max_steps:  # reached target steps
-                print("Reached max_steps, stopping training.")  # message
-                # Save a final checkpoint at exit
-                ck = {
-                    "args": vars(args),
-                    "model": model.state_dict(),
-                    "ema": ema.shadow.state_dict(),
-                    "opt": opt.state_dict(),
-                    "global_step": global_step,
-                    "epoch": epoch
-                }  # final checkpoint
-                torch.save(ck, str(outdir / "last.ckpt"))  # write file
-                return  # end training early
+            step += 1                                                 # increment step
 
-        # End of epoch: you could place epoch-based logic here (optional)
+            if step >= total_steps:                                   # stop if reached
+                break
 
-    # Finished all epochs: save checkpoint
-    ck = {
-        "args": vars(args),
-        "model": model.state_dict(),
-        "ema": ema.shadow.state_dict(),
-        "opt": opt.state_dict(),
-        "global_step": global_step,
-        "epoch": args.epochs
-    }  # final checkpoint (epochs completed)
-    torch.save(ck, str(outdir / "last.ckpt"))  # write file
-    print(f"Training completed. Saved checkpoint -> {outdir / 'last.ckpt'}")  # log final save
-
-# Entry point guard
-if __name__ == "__main__":  # if script is executed directly
-    main()  # run main
+    # Save final checkpoint
+    save_ckpt(os.path.join(args.outdir, "last.ckpt"), model, ema, vars(args), step)  # final save
+    print(f"Saved checkpoint -> {os.path.join(args.outdir, 'last.ckpt')}")           # notify
 
 
+if __name__ == "__main__":                                           # CLI entry
+    main()                                                           # run main
