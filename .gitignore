@@ -8,9 +8,6 @@ __pycache__/
 CUB_200_2011/
 data/
 runs/
-*.ckpt
-*.pt
-*.pth
 .cache/
 CUB_200_2011/
 cub*/
