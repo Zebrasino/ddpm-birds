@@ -95,6 +95,8 @@ def parse_args():
 
     # foreground loss weighting (1.0 = off)
     ap.add_argument("--fg_weight", type=float, default=3.0)          # weight inside bbox
+    ap.add_argument("--resume", type=str, default=None, help="Path to checkpoint .ckpt")
+
 
     return ap.parse_args()
 
