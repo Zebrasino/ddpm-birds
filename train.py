@@ -1,480 +1,319 @@
-# ============================
-# train.py  — DDPM training
-# Every line is commented.
-# ============================
+# train.py — fully commented, line-by-line, with foreground-weighted loss support
 
-# ---- standard libs
 import os  # filesystem utilities
-import json  # to save args as json in the checkpoint
-import math  # math helpers (may be used in scheduling)
-import glob  # to search for folders when resolving data_root
-import random  # for python-level seeding
-from dataclasses import asdict  # for neat args serialization (optional)
+import math  # for math helpers
+import argparse  # CLI argument parsing
+import random  # RNG for Python
+from pathlib import Path  # convenient path handling
+import time  # measure elapsed time
 
-# ---- numpy / torch
-import numpy as np  # numerical utilities
 import torch  # PyTorch main package
-import torch.nn as nn  # neural network layers
+import torch.nn as nn  # neural network building blocks
 import torch.optim as optim  # optimizers
-from torch.utils.data import DataLoader  # batched data iteration
-from torchvision import transforms  # image transforms
-import torchvision.datasets as tvds  # ImageFolder fallback
-from torchvision.utils import save_image  # to save sample grids
+from torch.utils.data import DataLoader  # data loader
+from torch.cuda.amp import GradScaler, autocast  # mixed-precision tools
 
-# ---- project modules
-from diffusion import Diffusion  # DDPM schedules and losses
-from unet import UNet  # U-Net denoiser
+from data import make_cub_bbox_dataset  # your dataset factory
+from unet import UNet  # the model (U-Net)
+from diffusion import Diffusion  # diffusion schedule + losses + samplers
+from utils import EMA  # exponential moving average helper (your utility)
 
-# ---- typing helpers
-from typing import Optional, Tuple  # type hints
+# ---------------------------
+# Small helpers
+# ---------------------------
+def set_seed(seed: int):
+    """Set all relevant random seeds for reproducibility."""
+    random.seed(seed)  # Python RNG
+    torch.manual_seed(seed)  # CPU RNG
+    torch.cuda.manual_seed_all(seed)  # GPU RNG
+    torch.backends.cudnn.deterministic = True  # deterministic convolution
+    torch.backends.cudnn.benchmark = False  # disable shape auto-tuning for determinism
 
-# ---- argparse
-import argparse  # command-line parsing
-
-
-# --------------------------
-# Utility: set all random seeds for reproducibility
-# --------------------------
-def set_seed(seed: int) -> None:
-    """Set Python/NumPy/Torch seeds for reproducibility."""
-    random.seed(seed)  # seed python's RNG
-    np.random.seed(seed)  # seed numpy RNG
-    torch.manual_seed(seed)  # seed torch CPU RNG
-    torch.cuda.manual_seed_all(seed)  # seed all CUDA devices
-    torch.backends.cudnn.deterministic = True  # deterministic convs
-    torch.backends.cudnn.benchmark = False  # disable autotuner for determinism
-
-
-# --------------------------
-# EMA helper: maintains an exponential moving average of model weights
-# --------------------------
-class EMA:
-    """Exponential Moving Average for model parameters."""
-
-    def __init__(self, model: nn.Module, mu: float = 0.999) -> None:
-        self.mu = mu  # decay factor (closer to 1 = smoother)
-        self.shadow = {}  # dict param_name -> averaged tensor (on same device)
-        # Initialize shadow weights as a copy of model's current state
-        for k, v in model.state_dict().items():  # iterate over all parameters/buffers
-            self.shadow[k] = v.detach().clone()  # store a clone detached from graph
-
-    @torch.no_grad()  # no gradients for EMA updates
-    def update(self, model: nn.Module) -> None:
-        """Update EMA weights from the current model parameters."""
-        msd = model.state_dict()  # get current model state dict
-        for k, v in msd.items():  # iterate parameters/buffers
-            if k not in self.shadow:  # if missing (unlikely), initialize
-                self.shadow[k] = v.detach().clone()
-            else:
-                # shadow = mu * shadow + (1 - mu) * new_value
-                self.shadow[k].lerp_(v.detach(), 1.0 - self.mu)
-
-    def state_dict(self) -> dict:
-        """Return the EMA weights as a state_dict-like dict."""
-        return self.shadow  # return the internal dict (already tensors)
-
-
-# --------------------------
-# Resolve data_root to the folder that directly contains "images/"
-# --------------------------
-def resolve_data_root(root: str) -> str:
-    """Return a folder path that directly contains 'images/'."""
-    if os.path.isdir(os.path.join(root, "images")):  # if root/images exists
-        return root  # already correct
-    cand = os.path.join(root, "CUB_200_2011")  # common nesting in Kaggle zips
-    if os.path.isdir(os.path.join(cand, "images")):  # if cand/images exists
-        return cand  # use nested folder
-    # Otherwise, search 2 levels deep for any folder that has images/
-    for d in glob.glob(os.path.join(root, "*")) + glob.glob(os.path.join(root, "*", "*")):
-        if os.path.isdir(os.path.join(d, "images")):  # found a valid folder
-            print(f"[auto] Using data_root -> {d}")  # inform user of auto-selection
-            return d  # return discovered folder
-    return root  # give back original (may error later, but prints help)
-
-
-# --------------------------
-# Try to build CUB dataset with BBoxes; fallback to ImageFolder if empty/fails
-# --------------------------
-def build_dataset_with_fallback(
-    args: argparse.Namespace,
-) -> Tuple[torch.utils.data.Dataset, int]:
+def center_gaussian_mask(B, H, W, device, sigma=0.5):
     """
-    Attempt to build the dataset via make_cub_bbox_dataset (from data.py).
-    If it fails or returns 0 samples, fallback to torchvision ImageFolder on images/.
-    Returns: (dataset, num_classes)
+    Create a centered 2D Gaussian mask in [0,1] of shape (B,1,H,W).
+    sigma is expressed as a fraction of half-size; smaller sigma = sharper peak.
     """
-    ds = None  # dataset placeholder
-    num_classes = None  # number of classes placeholder
+    # Coordinate grid normalized to [-1, 1]
+    ys = torch.linspace(-1, 1, steps=H, device=device)  # y coordinates
+    xs = torch.linspace(-1, 1, steps=W, device=device)  # x coordinates
+    Y, X = torch.meshgrid(ys, xs, indexing="ij")  # 2D grid
+    # Gaussian radial profile
+    R2 = X**2 + Y**2  # squared radius
+    # Convert sigma (fraction) to variance in this normalized grid
+    var = (sigma**2)  # variance
+    mask2d = torch.exp(-0.5 * R2 / (var + 1e-8))  # Gaussian function
+    mask2d = (mask2d - mask2d.min()) / (mask2d.max() - mask2d.min() + 1e-8)  # normalize to [0,1]
+    return mask2d.unsqueeze(0).unsqueeze(0).repeat(B, 1, 1, 1)  # (B,1,H,W)
 
-    # First, try the user's custom CUB loader that supports bounding boxes
-    try:
-        # Import locally to avoid hard import errors if signature differs
-        from data import make_cub_bbox_dataset  # project-provided function
+# ---------------------------
+# Arg parser
+# ---------------------------
+def build_argparser():
+    """Create an argument parser with all training knobs."""
+    p = argparse.ArgumentParser(description="Train DDPM on CUB with optional class conditioning.")
 
-        # Call ONLY with kwargs we know exist (older data.py may differ)
-        maybe = make_cub_bbox_dataset(
-            root=args.data_root,  # root folder that contains 'images/'
-            img_size=args.img_size,  # target square size
-            use_bbox=args.use_bbox,  # whether to crop by GT bboxes
-            bbox_expand=args.bbox_expand,  # expansion factor around bbox
-            class_limit=args.class_limit,  # limit number of species
-            subset=args.subset,  # limit number of total images
-        )
-        # Some versions may return just the dataset; others (dataset, num_classes)
-        if isinstance(maybe, tuple) and len(maybe) == 2:  # two-return variant
-            ds, num_classes = maybe  # unpack dataset and num_classes
-        else:
-            ds = maybe  # just dataset; we'll derive num_classes later
-        n_items = len(ds)  # attempt to count items (requires __len__)
-        print(f"[info] BBOX dataset built: {n_items} samples")  # print stats
-    except TypeError as e:
-        # Signature mismatch (e.g., unrecognized kw); warn and fallback
-        print("[warn] BBOX builder signature mismatch:", e)  # show error
-        ds, n_items = None, 0  # mark as unusable
-    except Exception as e:
-        # Any other runtime failure (e.g., missing files); warn and fallback
-        print("[warn] BBOX builder failed:", repr(e))  # show error
-        ds, n_items = None, 0  # mark as unusable
+    # Data / I/O
+    p.add_argument("--data_root", type=str, required=True, help="Path to CUB_200_2011 root folder")
+    p.add_argument("--use_bbox", action="store_true", help="Use bounding boxes (crop around bird)")
+    p.add_argument("--bbox_expand", type=float, default=1.0, help="BBox expansion factor (>=1.0)")
+    p.add_argument("--class_limit", type=int, default=None, help="Limit number of classes (e.g., 200)")
+    p.add_argument("--subset", type=int, default=None, help="Limit number of images per class")
+    p.add_argument("--img_size", type=int, default=64, help="Training image size")
 
-    # If failed OR empty, fallback to standard ImageFolder-based dataset
-    if ds is None or n_items == 0:  # if no dataset or empty
-        print("[fallback] Using ImageFolder (no bbox)")  # inform user
-        # Standard diffusion-normalizing transform pipeline
-        tfm = transforms.Compose(
-            [
-                transforms.Resize(args.img_size, interpolation=transforms.InterpolationMode.BICUBIC),  # resize
-                transforms.CenterCrop(args.img_size),  # center crop to square
-                transforms.ToTensor(),  # to tensor [0,1]
-                transforms.Normalize((0.5,) * 3, (0.5,) * 3),  # to [-1,1]
-            ]
-        )
-        img_root = os.path.join(args.data_root, "images")  # ImageFolder root
-        ds = tvds.ImageFolder(img_root, transform=tfm)  # create dataset
+    p.add_argument("--outdir", type=str, required=True, help="Output directory for checkpoints and logs")
 
-        # If requested, restrict to the first K class folders (sorted)
-        if args.class_limit:  # if user limits classes
-            keep_classes = sorted(ds.classes)[: int(args.class_limit)]  # select first K
-            keep_idx = [ds.class_to_idx[c] for c in keep_classes]  # map to indices
-            # Filter samples that belong to the kept indices
-            ds.samples = [s for s in ds.samples if s[1] in keep_idx]  # filter (path, label)
-            ds.targets = [s[1] for s in ds.samples]  # update targets vector
-            ds.classes = keep_classes  # update class names to the kept ones
+    # Optimization
+    p.add_argument("--batch_size", type=int, default=16, help="Batch size")
+    p.add_argument("--epochs", type=int, default=9999, help="Max epochs (used if max_steps not reached)")
+    p.add_argument("--max_steps", type=int, default=None, help="Stop after this many optimization steps")
+    p.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
+    p.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay for AdamW")
+    p.add_argument("--grad_clip", type=float, default=1.0, help="Gradient norm clipping threshold")
 
-        # If requested, limit to the first N images overall
-        if args.subset:  # if user limits total images
-            ds.samples = ds.samples[: int(args.subset)]  # slice first N images
-            ds.targets = [s[1] for s in ds.samples]  # update labels vector
+    # Diffusion schedule
+    p.add_argument("--num_steps", type=int, default=300, help="Number of diffusion steps T")
+    p.add_argument("--schedule", type=str, choices=["cosine", "linear"], default="cosine",
+                   help="Beta schedule type")
 
-        # ImageFolder expects .imgs attribute as alias (some APIs use it)
-        ds.imgs = ds.samples  # align alias
-        num_classes = len(ds.classes)  # derive number of classes from ImageFolder
-        n_items = len(ds)  # count items
-        print(f"[info] ImageFolder dataset built: {n_items} samples, {num_classes} classes")  # print stats
+    # Conditioning
+    p.add_argument("--cond_mode", type=str, choices=["none", "class"], default="none",
+                   help="Conditioning mode (none or class)")
+    p.add_argument("--p_uncond", type=float, default=0.1,
+                   help="Classifier-free guidance training prob: drop condition with this prob")
+    p.add_argument("--guidance_scale", type=float, default=0.0,
+                   help="CFG guidance scale used only for in-training previews/sampling")
 
-    # If still empty, throw a helpful error to the user
-    if n_items == 0:  # nothing to train on
-        raise RuntimeError(
-            f"Dataset is empty at '{args.data_root}'.\n"
-            f"- Ensure this folder contains an 'images/' subfolder.\n"
-            f"- If using --use_bbox, verify 'bounding_boxes.txt' exists and matches 'images.txt'.\n"
-            f"- Check class_limit={args.class_limit} and subset={args.subset}."
-        )
-
-    # If num_classes still unknown (custom builder returned only dataset), deduce it
-    if num_classes is None:  # if still None
-        # Use the user's intended limit or default to 200 (CUB standard)
-        num_classes = int(args.class_limit) if args.class_limit else 200  # reasonable default
-
-    print(f"[info] Final dataset: {len(ds)} samples | num_classes={num_classes}")  # summary line
-    return ds, num_classes  # return dataset and class count
-
-
-# --------------------------
-# Save a checkpoint dict to disk
-# --------------------------
-def save_checkpoint(
-    path: str,  # target file path (.ckpt)
-    model: nn.Module,  # current model
-    ema: Optional[EMA],  # EMA wrapper (may be None)
-    step: int,  # current training step
-    args: argparse.Namespace,  # parsed CLI args
-) -> None:
-    """Save training checkpoint to 'path'."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)  # ensure folder exists
-    ck = {  # build a dict with state
-        "step": step,  # save current step
-        "model": model.state_dict(),  # model weights
-        "ema": (ema.state_dict() if ema is not None else None),  # EMA weights if any
-        "args": vars(args),  # serialize args as plain dict (JSON-friendly)
-    }
-    torch.save(ck, path)  # write to disk
-    print(f"[ckpt] Saved -> {path}")  # notify user
-
-
-# --------------------------
-# Optional: quick sampling preview during training (DDIM)
-# --------------------------
-@torch.no_grad()  # disable gradients for sampling
-def preview_samples(
-    model: nn.Module,  # trained denoiser
-    diffusion: Diffusion,  # diffusion helper
-    img_size: int,  # output size (H = W)
-    outdir: str,  # folder to save the grid
-    step: int,  # step id for filename
-    use_ema: bool = False,  # if you pass an EMA-wrapped model outside
-    num_classes: Optional[int] = None,  # number of classes for conditional sampling
-    guidance_scale: float = 0.0,  # guidance scale (0 to disable)
-    cond_mode: str = "none",  # 'none' or 'class'
-) -> None:
-    """Generate a small grid of samples to monitor training."""
-    model.eval()  # set eval mode (disable dropout etc.)
-    n = 16  # number of samples in the grid
-    device = next(model.parameters()).device  # current device
-    # Prepare class labels if conditional sampling is enabled
-    y = None  # no labels by default
-    if cond_mode == "class" and num_classes is not None:  # if class-conditional
-        y = torch.randint(low=0, high=num_classes, size=(n,), device=device)  # random classes
-    # Use DDIM sampler for fast and robust preview
-    x = diffusion.sample_ddim(  # call DDIM sampler provided by diffusion.py
-        model=model,  # denoiser
-        shape=(n, 3, img_size, img_size),  # output shape
-        steps=min(50, diffusion.T),  # take up to 50 steps for speed
-        eta=0.0,  # deterministic DDIM
-        y=y,  # labels (or None)
-        guidance_scale=guidance_scale,  # CFG strength for sampling
-    )
-    x = (x.clamp(-1, 1) + 1) / 2  # map from [-1,1] to [0,1] for saving
-    os.makedirs(outdir, exist_ok=True)  # ensure folder exists
-    grid_path = os.path.join(outdir, f"samples_step_{step:06d}.png")  # file path
-    save_image(x, grid_path, nrow=4)  # save 4x4 grid
-    print(f"[sample] Wrote {grid_path}")  # notify user
-
-
-# --------------------------
-# Argument parser
-# --------------------------
-def get_args() -> argparse.Namespace:
-    """Parse command-line arguments."""
-    p = argparse.ArgumentParser(description="DDPM training on CUB-200-2011")  # CLI help title
-
-    # Data settings
-    p.add_argument("--data_root", type=str, required=True, help="Folder that contains 'images/'")  # data root
-    p.add_argument("--use_bbox", action="store_true", help="Use GT bounding boxes if available")  # bbox flag
-    p.add_argument("--bbox_expand", type=float, default=1.0, help="BBox expansion factor")  # bbox expand
-    p.add_argument("--class_limit", type=int, default=None, help="Limit number of classes")  # class limit
-    p.add_argument("--subset", type=int, default=None, help="Limit number of images")  # subset limit
-    p.add_argument("--img_size", type=int, default=64, help="Square image size")  # target size
-
-    # Training hyperparams
-    p.add_argument("--outdir", type=str, required=True, help="Output directory for logs/ckpts")  # outdir
-    p.add_argument("--batch_size", type=int, default=16, help="Batch size")  # batch size
-    p.add_argument("--epochs", type=int, default=9999, help="Upper bound on epochs (looped via steps)")  # epochs
-    p.add_argument("--max_steps", type=int, default=60000, help="Stop after this many steps")  # early stop
-    p.add_argument("--lr", type=float, default=2e-4, help="AdamW learning rate")  # learning rate
-    p.add_argument("--weight_decay", type=float, default=0.0, help="AdamW weight decay")  # weight decay
-    p.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping max-norm")  # grad clip
-
-    # Diffusion process
-    p.add_argument("--num_steps", type=int, default=300, help="Number of diffusion time steps T")  # T
-    p.add_argument("--schedule", type=str, default="cosine", choices=["cosine", "linear"], help="Beta schedule")  # schedule
-
-    # Conditioning & CFG
-    p.add_argument("--cond_mode", type=str, default="none", choices=["none", "class"], help="Conditioning mode")  # cond
-    p.add_argument("--p_uncond", type=float, default=0.1, help="Drop-label prob (CFG) during training")  # p_uncond
-    p.add_argument("--guidance_scale", type=float, default=0.0, help="Guidance scale for on-the-fly preview")  # scale
-
-    # Model size
-    p.add_argument("--base", type=int, default=64, help="UNet base channels")  # base channels
+    # Model
+    p.add_argument("--base", type=int, default=64, help="UNet base channel multiplier")
 
     # EMA
-    p.add_argument("--ema_mu", type=float, default=0.999, help="EMA decay")  # EMA decay
+    p.add_argument("--ema_mu", type=float, default=0.999, help="EMA decay for model parameters")
 
-    # Logging / checkpointing
-    p.add_argument("--log_every", type=int, default=1000, help="Print loss every N steps")  # logging freq
-    p.add_argument("--ckpt_every", type=int, default=1000, help="Save checkpoint every N steps")  # ckpt freq
+    # Logging / checkpoints
+    p.add_argument("--log_every", type=int, default=500, help="Log every N steps")
+    p.add_argument("--ckpt_every", type=int, default=2000, help="Save checkpoint every N steps")
+    p.add_argument("--seed", type=int, default=0, help="Random seed")
+    p.add_argument("--resume", type=str, default=None, help="Path to a checkpoint to resume from")
+    p.add_argument("--preview_every", type=int, default=0,
+                   help="If >0, run a quick sample preview every N steps")
 
-    # Misc
-    p.add_argument("--seed", type=int, default=0, help="Random seed")  # seed
-    p.add_argument("--resume", type=str, default=None, help="Resume from checkpoint path")  # resume path
-    p.add_argument("--preview_every", type=int, default=0, help="If >0, run DDIM preview every N steps")  # preview
+    # Foreground weighting (this is the reintroduced flag)
+    p.add_argument("--fg_weight", type=float, default=1.0,
+                   help="Extra weight for foreground pixels in the loss (>=1).")
+    p.add_argument("--fg_sigma", type=float, default=0.5,
+                   help="Sigma for center-gaussian mask if no mask is provided by the dataset.")
 
-    return p.parse_args()  # parse and return
+    return p
 
+# ---------------------------
+# Main
+# ---------------------------
+def main():
+    """Main training routine."""
+    # Parse arguments
+    args = build_argparser().parse_args()  # parse all CLI arguments
 
-# --------------------------
-# Main training function
-# --------------------------
-def main() -> None:
-    """Main entry point to train the DDPM."""
-    args = get_args()  # parse CLI flags
-    set_seed(args.seed)  # set all RNG seeds for reproducibility
+    # Prepare output directory
+    outdir = Path(args.outdir)  # turn into Path object
+    outdir.mkdir(parents=True, exist_ok=True)  # create folder if not exists
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"  # choose device
+    # Set random seeds for reproducibility
+    set_seed(args.seed)  # sync seeds
 
-    args.data_root = resolve_data_root(args.data_root)  # normalize data_root
-    print("[info] data_root resolved to:", args.data_root)  # print result
+    # Pick device
+    device = "cuda" if torch.cuda.is_available() else "cpu"  # choose GPU if available
 
-    ds, num_classes = build_dataset_with_fallback(args)  # dataset + class count
+    # Build dataset (returns a PyTorch Dataset)
+    # NOTE: make_cub_bbox_dataset returns a Dataset (not (ds, num_classes))
+    ds = make_cub_bbox_dataset(
+        root=args.data_root,          # CUB root path
+        img_size=args.img_size,       # training resolution
+        use_bbox=args.use_bbox,       # crop around bbox if requested
+        bbox_expand=args.bbox_expand, # expand factor
+        class_limit=args.class_limit, # limit number of classes
+        subset=args.subset            # limit images per class
+    )
 
-    # Build the model; if cond_mode is 'class', pass num_classes else None
-    model = UNet(base=args.base, num_classes=(num_classes if args.cond_mode == "class" else None)).to(device)  # UNet
-    model.train()  # enable train mode
-
-    # Build diffusion helper (betas schedule, alphas, etc.)
-    diffusion = Diffusion(T=args.num_steps, schedule=args.schedule, device=torch.device(device))  # DDPM object
-
-    # Prepare optimizer (AdamW is a good default for diffusion models)
-    opt = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)  # optimizer
-
-    # AMP autocast and GradScaler (new API removes deprecation warnings)
-    autocast = torch.amp.autocast  # alias to torch.amp.autocast context manager
-    scaler = torch.amp.GradScaler(device_type="cuda" if device == "cuda" else "cpu")  # AMP scaler
-
-    # Optional EMA over parameters
-    ema = EMA(model, mu=args.ema_mu)  # create EMA helper
+    # Infer number of classes if we are in class-conditional mode
+    if args.cond_mode == "class":
+        # Assumes the dataset exposes an attribute 'num_classes'
+        assert hasattr(ds, "num_classes"), "Dataset must have 'num_classes' attribute for class conditioning."
+        num_classes = ds.num_classes  # number of labels in the dataset
+    else:
+        num_classes = None  # unconditioned model
 
     # DataLoader for training
     dl = DataLoader(
-        ds,  # dataset built above
-        batch_size=args.batch_size,  # batch size from args
-        shuffle=True,  # shuffle each epoch
-        num_workers=2,  # a couple of workers is enough on Colab
-        pin_memory=(device == "cuda"),  # pin host memory if GPU
-        drop_last=True,  # drop last incomplete batch for stable shapes
+        ds,                      # dataset
+        batch_size=args.batch_size,  # batch size
+        shuffle=True,                # shuffle data
+        num_workers=2,               # small number of workers (Colab-friendly)
+        pin_memory=True,             # faster host->device transfers
+        drop_last=True               # enforce full batches
     )
 
-    # Optionally resume from a previous checkpoint
-    start_step = 0  # initialize step counter
-    if args.resume is not None and os.path.isfile(args.resume):  # if valid resume path
-        ckpt = torch.load(args.resume, map_location=device)  # load checkpoint dict
-        model.load_state_dict(ckpt["model"], strict=False)  # restore model weights
-        if ckpt.get("ema") is not None:  # if EMA weights exist
-            # re-init EMA with current model then copy its shadow weights
-            ema = EMA(model, mu=args.ema_mu)  # re-create EMA wrapper
-            for k in ema.shadow:  # iterate EMA dict keys
-                if k in ckpt["ema"]:  # only copy existing keys
-                    ema.shadow[k].copy_(ckpt["ema"][k])  # copy tensor
-        start_step = int(ckpt.get("step", 0))  # resume step counter
-        print(f"[resume] Loaded {args.resume} at step {start_step}")  # log resume
+    # Create model
+    model = UNet(base=args.base, num_classes=num_classes).to(device)  # instantiate UNet
 
-    # Create outdir
-    os.makedirs(args.outdir, exist_ok=True)  # ensure output directory exists
+    # Exponential Moving Average wrapper
+    ema = EMA(model, mu=args.ema_mu)  # create EMA tracker
 
-    # Training loop by steps (epochs just bound the outer loop)
-    step = start_step  # current global step
-    # Outer loop (epochs) just cycles over the dataloader
-    for ep in range(args.epochs):  # potentially large number (we stop by max_steps)
-        # Iterate over the dataloader
-        for batch in dl:  # each batch from dataset
-            if step >= args.max_steps:  # stop condition
-                print("Reached max_steps, stopping training.")  # print and stop
-                break  # break inner loop
-
-            # Unpack batch: ImageFolder returns (img, label)
-            if isinstance(batch, (tuple, list)) and len(batch) >= 1:  # tuple/list check
-                x = batch[0].to(device, non_blocking=True)  # images tensor to device
-                y = batch[1].to(device, non_blocking=True) if (len(batch) > 1) else None  # labels if present
-            else:
-                # If dataset returns only images, set y=None
-                x = batch.to(device, non_blocking=True)  # images to device
-                y = None  # no labels
-
-            # If training unconditioned, ignore labels entirely
-            if args.cond_mode != "class":  # not class-conditional
-                y_in = None  # pass None to diffusion loss
-            else:
-                y_in = y  # class labels used for conditional training
-
-            # Mixed precision forward + loss
-            with autocast(device_type=("cuda" if device == "cuda" else "cpu")):  # AMP autocast
-                # Compute epsilon-prediction MSE loss at random timesteps
-                loss = diffusion.p_losses(  # DDPM loss function
-                    model=model,  # denoiser model
-                    x_start=x,  # clean images
-                    y=y_in,  # labels or None
-                    p_uncond=args.p_uncond,  # drop-label probability for CFG
-                )
-
-            # Backward pass with AMP scaling
-            scaler.scale(loss).backward()  # compute scaled gradients
-
-            # Gradient clipping (important for stability)
-            if args.grad_clip is not None and args.grad_clip > 0:  # if enabled
-                scaler.unscale_(opt)  # unscale before clipping
-                nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)  # clip
-
-            # Optimizer step with scaler
-            scaler.step(opt)  # apply optimizer step
-            scaler.update()  # update scaler state
-            opt.zero_grad(set_to_none=True)  # reset gradients (set_to_none saves memory)
-
-            # EMA update
-            ema.update(model)  # update moving average of weights
-
-            # Step counter increments
-            step += 1  # increment step
-
-            # Logging every N steps
-            if (step % args.log_every) == 0:  # check frequency
-                print(f"step {step} | loss {loss.item():.4f} | lr {args.lr:.2e}")  # print metrics
-
-            # Optional sampling preview every N steps
-            if args.preview_every and (step % args.preview_every) == 0:  # if enabled
-                # Temporarily swap to EMA weights for sampling preview
-                sd_backup = model.state_dict()  # backup current weights
-                model.load_state_dict(ema.state_dict(), strict=False)  # load EMA weights
-                try:
-                    preview_samples(  # run quick DDIM sampling
-                        model=model,  # denoiser
-                        diffusion=diffusion,  # helper
-                        img_size=args.img_size,  # output size
-                        outdir=os.path.join(args.outdir, "previews"),  # preview folder
-                        step=step,  # filename id
-                        use_ema=True,  # we used EMA weights
-                        num_classes=(num_classes if args.cond_mode == "class" else None),  # cond
-                        guidance_scale=args.guidance_scale,  # CFG scale
-                        cond_mode=args.cond_mode,  # cond mode
-                    )
-                finally:
-                    model.load_state_dict(sd_backup, strict=False)  # restore training weights
-
-            # Periodic checkpoint save
-            if (step % args.ckpt_every) == 0:  # on frequency
-                # Save both rolling 'last.ckpt' and step-tagged ckpt
-                save_checkpoint(  # write step-tagged ckpt
-                    path=os.path.join(args.outdir, f"ckpt_{step:06d}.ckpt"),  # path with step
-                    model=model,  # current model
-                    ema=ema,  # EMA wrapper
-                    step=step,  # current step
-                    args=args,  # args dict
-                )
-                save_checkpoint(  # write/overwrite last.ckpt
-                    path=os.path.join(args.outdir, "last.ckpt"),  # rolling last
-                    model=model,  # model
-                    ema=ema,  # EMA
-                    step=step,  # step
-                    args=args,  # args
-                )
-
-        # If we hit max_steps in the inner loop, exit the outer loop as well
-        if step >= args.max_steps:  # double-check after epoch boundary
-            break  # stop training
-
-    # Final checkpoint save when training finishes (ensure we have last state)
-    save_checkpoint(  # save final 'last.ckpt'
-        path=os.path.join(args.outdir, "last.ckpt"),  # final last file
-        model=model,  # model
-        ema=ema,  # EMA
-        step=step,  # final step
-        args=args,  # args
+    # Diffusion driver (schedule + forward training loss + samplers)
+    diffusion = Diffusion(
+        T=args.num_steps,            # number of diffusion steps
+        schedule=args.schedule,      # cosine or linear
+        device=torch.device(device)  # target device
     )
-    print("[done] Training finished.")  # training over
 
+    # Optimizer: AdamW
+    optim_params = [p for p in model.parameters() if p.requires_grad]  # trainable params
+    opt = optim.AdamW(optim_params, lr=args.lr, weight_decay=args.weight_decay)  # optimizer
 
-# --------------------------
-# Entry point
-# --------------------------
-if __name__ == "__main__":  # python main guard
-    main()  # launch training
+    # AMP GradScaler for mixed precision stability
+    scaler = GradScaler()  # create scaler
+
+    # Optionally resume from checkpoint
+    global_step = 0  # count optimizer steps
+    start_epoch = 0  # starting epoch index
+    if args.resume is not None and os.path.isfile(args.resume):  # if a resume path exists
+        ckpt = torch.load(args.resume, map_location=device)  # load checkpoint
+        model.load_state_dict(ckpt["model"], strict=False)  # restore model weights (strict=False for safety)
+        if "ema" in ckpt:  # if EMA states are present
+            ema.shadow.load_state_dict(ckpt["ema"])  # restore EMA weights
+        if "opt" in ckpt:  # if optimizer state present
+            opt.load_state_dict(ckpt["opt"])  # restore optimizer
+        global_step = ckpt.get("global_step", 0)  # restore step count
+        start_epoch = ckpt.get("epoch", 0)  # restore epoch count
+        print(f"[resume] Loaded checkpoint from {args.resume} (step={global_step}, epoch={start_epoch})")  # log resume
+
+    # Training loop
+    t0 = time.time()  # start timer
+    for epoch in range(start_epoch, args.epochs):  # iterate over epochs
+        for batch in dl:  # iterate over batches
+            # Unpack batch; support (x,y) or (x,y,mask)
+            if isinstance(batch, (list, tuple)) and len(batch) == 3:
+                x, y, mask = batch  # dataset provided a mask tensor
+            elif isinstance(batch, (list, tuple)) and len(batch) == 2:
+                x, y = batch  # only image and label
+                mask = None   # no mask provided
+            else:
+                # If dataset returns only images (unconditional)
+                x = batch  # image tensor
+                y = None   # no labels
+                mask = None  # no mask
+
+            x = x.to(device, non_blocking=True)  # move images to device
+            if y is not None:
+                y = y.to(device, non_blocking=True)  # move labels to device
+
+            # Build a center prior mask if no mask is present and fg_weight > 1
+            if mask is None and args.fg_weight > 1.0:
+                B, C, H, W = x.shape  # extract shapes
+                mask = center_gaussian_mask(B, H, W, device, sigma=args.fg_sigma)  # build center mask
+            elif mask is not None:
+                # Make sure mask has shape (B,1,H,W) and is float in [0,1]
+                if mask.dim() == 3:  # (B,H,W)
+                    mask = mask.unsqueeze(1)  # add channel dim
+                mask = mask.to(device, dtype=x.dtype)  # type & device
+                mask = mask.clamp(0, 1)  # clamp to [0,1]
+
+            # Forward + loss under AMP autocast
+            opt.zero_grad(set_to_none=True)  # clear gradients
+            with autocast():  # enable mixed precision on CUDA automatically
+                # Compute DDPM loss; pass optional foreground mask + weight
+                loss = diffusion.p_losses(
+                    model,              # UNet
+                    x0=x,               # clean image
+                    y=y,                # labels (or None)
+                    p_uncond=args.p_uncond if args.cond_mode == "class" else 0.0,  # CFG drop prob
+                    mask=mask,          # optional foreground mask
+                    fg_weight=args.fg_weight  # extra weight for mask==1 pixels
+                )  # returns scalar loss
+
+            # Backprop with AMP scaling
+            scaler.scale(loss).backward()  # backward pass (scaled)
+            if args.grad_clip is not None and args.grad_clip > 0:  # if gradient clipping enabled
+                scaler.unscale_(opt)  # unscale grads for clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)  # clip by norm
+            scaler.step(opt)  # optimizer step (scaled)
+            scaler.update()  # update scaler
+
+            # Update EMA after optimizer step
+            ema.update(model)  # blend current weights into EMA shadow
+
+            # Increase global step
+            global_step += 1  # increment
+
+            # Logging
+            if (global_step % args.log_every) == 0:  # periodic logging
+                elapsed = time.time() - t0  # seconds elapsed
+                print(f"step {global_step} | loss {loss.item():.4f} | lr {opt.param_groups[0]['lr']:.2e} | {elapsed/60:.1f} min")  # log line
+
+            # Optional preview sampling during training (lightweight DDIM)
+            if args.preview_every > 0 and (global_step % args.preview_every) == 0:  # if preview is requested
+                model_eval = ema.shadow  # use EMA for nicer samples
+                model_eval.eval()  # eval mode
+                with torch.no_grad():  # no grads
+                    # quick sample (deterministic DDIM, few steps)
+                    x_gen = diffusion.sample_ddim(
+                        model_eval,                    # model for sampling
+                        shape=(16, 3, args.img_size, args.img_size),  # sample grid
+                        steps=min(50, args.num_steps), # number of DDIM steps
+                        eta=0.0,                       # deterministic
+                        y=None,                        # unconditional preview
+                        guidance_scale=0.0             # no CFG here
+                    )  # returns (B,3,H,W) in [-1,1]
+                    # save preview grid
+                    from torchvision.utils import save_image  # lazy import
+                    grid = (x_gen.clamp(-1, 1) + 1) / 2.0  # to [0,1]
+                    save_image(grid, str(outdir / f"preview_step_{global_step:06d}.png"), nrow=4)  # write file
+                model_eval.train()  # back to train (for safety)
+
+            # Periodic checkpointing
+            if (global_step % args.ckpt_every) == 0:  # every N steps
+                ck = {
+                    "args": vars(args),        # store args
+                    "model": model.state_dict(),  # model weights
+                    "ema": ema.shadow.state_dict(),  # EMA weights
+                    "opt": opt.state_dict(),   # optimizer state
+                    "global_step": global_step,  # step count
+                    "epoch": epoch             # epoch count
+                }  # checkpoint dict
+                torch.save(ck, str(outdir / "last.ckpt"))  # save file
+                print(f"Saved checkpoint -> {outdir / 'last.ckpt'}")  # log path
+
+            # Early stop on max_steps
+            if args.max_steps is not None and global_step >= args.max_steps:  # reached target steps
+                print("Reached max_steps, stopping training.")  # message
+                # Save a final checkpoint at exit
+                ck = {
+                    "args": vars(args),
+                    "model": model.state_dict(),
+                    "ema": ema.shadow.state_dict(),
+                    "opt": opt.state_dict(),
+                    "global_step": global_step,
+                    "epoch": epoch
+                }  # final checkpoint
+                torch.save(ck, str(outdir / "last.ckpt"))  # write file
+                return  # end training early
+
+        # End of epoch: you could place epoch-based logic here (optional)
+
+    # Finished all epochs: save checkpoint
+    ck = {
+        "args": vars(args),
+        "model": model.state_dict(),
+        "ema": ema.shadow.state_dict(),
+        "opt": opt.state_dict(),
+        "global_step": global_step,
+        "epoch": args.epochs
+    }  # final checkpoint (epochs completed)
+    torch.save(ck, str(outdir / "last.ckpt"))  # write file
+    print(f"Training completed. Saved checkpoint -> {outdir / 'last.ckpt'}")  # log final save
+
+# Entry point guard
+if __name__ == "__main__":  # if script is executed directly
+    main()  # run main
 
 
