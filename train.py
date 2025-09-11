@@ -202,16 +202,16 @@ def main():
     # - Each sample ideally yields: (image_tensor[-1..1], class_idx, fg_mask[0/1])
     #   If fg_mask not available, we’ll handle it below.
     # -------------------------------------------------------------------------
-    # Build dataset (fixed kwarg name: bbox_expand)
+    # Build dataset (only with supported arguments)
     ds, num_classes = make_cub_bbox_dataset(
         root=args.data_root,
         img_size=args.img_size,
         use_bbox=args.use_bbox,
-        bbox_expand=args.bbox_expand,   # <-- FIXED
+        bbox_expand=args.bbox_expand,   # works, present in your data.py
         class_limit=args.class_limit,
         subset=args.subset,
-        aug_color=args.aug_color,
     )
+
 
 
     # Tell the model how many classes (None if unconditional)
