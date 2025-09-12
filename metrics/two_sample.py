@@ -1,19 +1,20 @@
-import argparse, json, math, warnings
-from pathlib import Path
-from typing import Tuple
+import argparse, json, math, warnings          # CLI parsing, JSON output, math utils, and silencing warnings
+from pathlib import Path                        # convenient, cross-platform paths
+from typing import Tuple                        # type annotations for function returns
 
-import numpy as np
-from PIL import Image
+import numpy as np                              # numerical arrays, vectorized ops
+from PIL import Image                           # image loading
 
-import torch
-import torchvision as tv
-from torchvision import transforms as T
+import torch                                    # tensors, GPU/CPU acceleration
+import torchvision as tv                        # models (InceptionV3)
+from torchvision import transforms as T         # imagenet preprocessing transforms
 
 # Silence noisy warnings from PIL/torch to keep logs readable
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # ------------------------------ CLI ---------------------------------
 def parse_args():
+    """Parse command-line arguments for input folders, batch size, test type, etc."""
     ap = argparse.ArgumentParser(description="Two-sample tests (C2ST, MMD) on Inception features.")
     ap.add_argument("--fake_dir", type=str, required=True, help="Folder with generated images (flat).")
     ap.add_argument("--real_dir", type=str, required=True, help="Folder with real images (flat).")
@@ -29,17 +30,18 @@ def parse_args():
 def build_inception_and_transform(device: torch.device):
     """
     Build an InceptionV3 model and the corresponding preprocessing transform.
-    We use pre-logit (avgpool) features (shape: Bx2048).
+    We capture pre-logit (avgpool) features of shape (B, 2048).
+    Using aux_logits=True for torchvision compatibility (newer releases require it).
     """
     try:
-        # Newer torchvision: official weights and ready-made transforms
-        weights = tv.models.Inception_V3_Weights.IMAGENET1K_V1
-        model = tv.models.inception_v3(weights=weights, aux_logits=False).to(device).eval()
-        transform = weights.transforms()
+        # Newer torchvision API: use official weights object + ready-made transforms
+        weights = tv.models.Inception_V3_Weights.IMAGENET1K_V1     # pretrained weights enum
+        model = tv.models.inception_v3(weights=weights, aux_logits=True).to(device).eval()  # eval mode
+        transform = weights.transforms()                            # proper resize/normalize pipeline
     except Exception:
-        # Fallback for older versions
-        model = tv.models.inception_v3(pretrained=True, aux_logits=False).to(device).eval()
-        transform = T.Compose([
+        # Fallback for older torchvision where "pretrained=True" is the standard flag
+        model = tv.models.inception_v3(pretrained=True, aux_logits=True).to(device).eval()
+        transform = T.Compose([                                     # manual ImageNet preprocessing
             T.Resize(299, interpolation=T.InterpolationMode.BICUBIC),
             T.CenterCrop(299),
             T.ToTensor(),
@@ -51,80 +53,81 @@ def build_inception_and_transform(device: torch.device):
 def extract_features(dirpath: str, model, transform, batch: int, device: torch.device) -> np.ndarray:
     """
     Walk the folder, load images, push through Inception, and collect 2048-D features.
-    Returns a numpy array of shape (N, 2048).
+    Returns a numpy array of shape (N, 2048) in float32.
     """
-    # Collect all PNG/JPG files (flat folder expected)
+    # Collect all PNG/JPG files from a *flat* directory (no recursion)
     paths = sorted([p for p in Path(dirpath).glob("*.png")] +
                    [p for p in Path(dirpath).glob("*.jpg")]  +
                    [p for p in Path(dirpath).glob("*.jpeg")])
     if len(paths) == 0:
         raise FileNotFoundError(f"No images found in {dirpath}. Provide a flat folder of PNG/JPG.")
 
-    feats_list = []             # where we accumulate batch features
-    hook_out = []               # temporary storage for the forward hook
+    feats_list = []                 # accumulates per-batch feature tensors
+    hook_out = []                   # stores the output captured by the forward hook
 
-    # We hook avgpool to capture pre-logit activations: (B, 2048, 1, 1)
+    # Define a forward hook on avgpool to capture pre-logit activations: (B, 2048, 1, 1)
     def _hook(m, i, o):
-        hook_out.append(o.squeeze(-1).squeeze(-1))
+        hook_out.append(o.squeeze(-1).squeeze(-1))   # squeeze spatial dims -> (B, 2048)
 
-    handle = model.avgpool.register_forward_hook(_hook)
+    handle = model.avgpool.register_forward_hook(_hook)  # attach the hook
 
-    # Iterate in batches to avoid OOM
+    # Iterate in mini-batches to control memory usage
     for i in range(0, len(paths), batch):
-        imgs = [transform(Image.open(p).convert("RGB")) for p in paths[i:i+batch]]
-        x = torch.stack(imgs, 0).to(device)
-        hook_out.clear()
-        _ = model(x)            # run forward; hook fills hook_out
-        feats_list.append(hook_out[0].detach().cpu())
+        imgs = [transform(Image.open(p).convert("RGB")) for p in paths[i:i+batch]]  # load+preprocess
+        x = torch.stack(imgs, 0).to(device)                                         # (B, 3, 299, 299)
+        hook_out.clear()                                                            # reset hook buffer
+        _ = model(x)                                                                # forward pass; hook fills hook_out
+        feats_list.append(hook_out[0].detach().cpu())                               # collect (B, 2048)
 
-    handle.remove()
-    feats = torch.cat(feats_list, 0).numpy().astype(np.float32)  # (N, 2048) float32
+    handle.remove()                                                                 # detach the hook
+    feats = torch.cat(feats_list, 0).numpy().astype(np.float32)                     # (N, 2048) float32
     return feats
 
 # ----------------------------- C2ST ---------------------------------
 def c2st_auc_pvalue(fake: np.ndarray, real: np.ndarray, seed: int, n_perm: int) -> Tuple[float, float]:
     """
     Classifier Two-Sample Test:
-      - Split features into train/test (stratified)
-      - Train Logistic Regression (L2)
-      - Report ROC-AUC on test
-      - Permute test labels to obtain a p-value (how often permuted AUC >= observed)
+      - Stratified train/test split
+      - Train Logistic Regression (with standardization)
+      - ROC-AUC on test as the statistic
+      - Permute only the *test* labels to obtain a p-value (how often permuted AUC >= observed)
+    Returns (auc_observed, p_value).
     """
-    from sklearn.model_selection import train_test_split
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.pipeline import make_pipeline
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.metrics import roc_auc_score
+    from sklearn.model_selection import train_test_split      # stratified split util
+    from sklearn.preprocessing import StandardScaler          # feature standardization
+    from sklearn.pipeline import make_pipeline                # compose scaler + classifier
+    from sklearn.linear_model import LogisticRegression       # logistic regression classifier
+    from sklearn.metrics import roc_auc_score                 # ROC-AUC metric
 
-    # Build dataset: y=0 (fake), y=1 (real)
-    X = np.concatenate([fake, real], axis=0)
-    y = np.concatenate([np.zeros(len(fake)), np.ones(len(real))], axis=0)
+    # Build the dataset: label 0 = fake, label 1 = real
+    X = np.concatenate([fake, real], axis=0)                  # features stacked
+    y = np.concatenate([np.zeros(len(fake)), np.ones(len(real))], axis=0)  # binary labels
 
-    # Stratified split (70/30)
+    # Stratified split (70% train / 30% test) for balanced evaluation
     Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.3, stratify=y, random_state=seed)
 
-    # Pipeline: Standardize -> Logistic Regression (handles scale and is fast/robust)
+    # Standardize -> Logistic Regression (robust and fast)
     clf = make_pipeline(
-        StandardScaler(with_mean=True, with_std=True),
-        LogisticRegression(max_iter=1000, n_jobs=1)
+        StandardScaler(with_mean=True, with_std=True),        # zero-mean/unit-variance scaling
+        LogisticRegression(max_iter=1000, n_jobs=1)           # classifier; n_jobs used by some solvers
     )
-    clf.fit(Xtr, ytr)
+    clf.fit(Xtr, ytr)                                         # train on the training split
 
-    # Probabilities on test to compute ROC-AUC
-    proba = clf.predict_proba(Xte)[:, 1]
-    auc_obs = float(roc_auc_score(yte, proba))
+    # Predicted probabilities on the test split for ROC-AUC
+    proba = clf.predict_proba(Xte)[:, 1]                      # probability of class "real"
+    auc_obs = float(roc_auc_score(yte, proba))                # observed AUC
 
-    # Permutation test on the *test* labels only (condition on trained classifier)
-    rng = np.random.default_rng(seed)
-    cnt = 0
+    # Permutation test on the test labels (conditioned on the trained classifier)
+    rng = np.random.default_rng(seed)                         # reproducible RNG
+    cnt = 0                                                   # count how many permuted AUC >= observed
     for _ in range(n_perm):
-        yperm = rng.permutation(yte)
-        auc_p = roc_auc_score(yperm, proba)
+        yperm = rng.permutation(yte)                          # shuffle labels
+        auc_p = roc_auc_score(yperm, proba)                   # AUC under permuted labels
         if auc_p >= auc_obs:
             cnt += 1
-    pval = (cnt + 1) / (n_perm + 1)  # add-one smoothing for stability
+    pval = (cnt + 1) / (n_perm + 1)                           # add-one smoothing for stability
 
-    return auc_obs, pval
+    return auc_obs, pval                                       # return statistic and p-value
 
 # ----------------------------- MMD ----------------------------------
 def _pdist2(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -132,89 +135,88 @@ def _pdist2(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     Pairwise squared Euclidean distances between rows of a (n×d) and b (m×d).
     Returns an (n×m) matrix. Computed on CPU to keep GPU free.
     """
-    a2 = (a * a).sum(1, keepdim=True)          # (n, 1)
-    b2 = (b * b).sum(1, keepdim=True).T        # (1, m)
-    return (a2 + b2 - 2.0 * (a @ b.T)).clamp_min_(0.0)
+    a2 = (a * a).sum(1, keepdim=True)          # (n, 1)   sum of squares per row of a
+    b2 = (b * b).sum(1, keepdim=True).T        # (1, m)   sum of squares per row of b, transposed
+    return (a2 + b2 - 2.0 * (a @ b.T)).clamp_min_(0.0)  # ||a-b||^2 with numerical safety
 
 def mmd2_rbf_unbiased(fake: np.ndarray, real: np.ndarray, sigma: float | None = None) -> Tuple[float, float]:
     """
     Unbiased estimate of MMD^2 with an RBF kernel.
     - sigma: bandwidth. If None, uses the median heuristic computed on joint distances.
-    Returns (mmd2, sigma).
+    Returns (mmd2, sigma_used).
     """
-    # Move to torch CPU tensors (float64 for numerical stability)
-    X = torch.from_numpy(fake).double()
-    Y = torch.from_numpy(real).double()
+    # Move to torch CPU tensors (float64 improves numerical stability)
+    X = torch.from_numpy(fake).double()        # (n, d)
+    Y = torch.from_numpy(real).double()        # (m, d)
 
-    # Compute pairwise squared distances
-    Kxx_d2 = _pdist2(X, X)
-    Kyy_d2 = _pdist2(Y, Y)
-    Kxy_d2 = _pdist2(X, Y)
+    # Compute pairwise squared distances for Kxx, Kyy, Kxy
+    Kxx_d2 = _pdist2(X, X)                     # (n, n)
+    Kyy_d2 = _pdist2(Y, Y)                     # (m, m)
+    Kxy_d2 = _pdist2(X, Y)                     # (n, m)
 
-    # Median heuristic for sigma if not provided (avoid using diagonal zeros)
+    # Median heuristic for sigma if not provided (exclude zeros on diagonals)
     if sigma is None:
-        # Concatenate upper-triangular (without diag) of Kxx and Kyy plus full Kxy
-        # For speed and simplicity here we take the median of all strictly positive entries.
-        all_d2 = torch.cat([Kxx_d2.flatten(), Kyy_d2.flatten(), Kxy_d2.flatten()], 0)
-        all_d2 = all_d2[all_d2 > 0]
-        med = torch.median(all_d2)
-        sigma = math.sqrt(0.5 * float(med.item())) if med.numel() > 0 else 1.0
-        sigma = max(sigma, 1e-6)
+        all_d2 = torch.cat([Kxx_d2.flatten(), Kyy_d2.flatten(), Kxy_d2.flatten()], 0)  # pool all distances
+        all_d2 = all_d2[all_d2 > 0]                 # remove zeros (self-distances)
+        med = torch.median(all_d2)                  # median of positive distances
+        sigma = math.sqrt(0.5 * float(med.item())) if med.numel() > 0 else 1.0  # heuristic bandwidth
+        sigma = max(sigma, 1e-6)                    # avoid degenerate bandwidth
 
-    gamma = 1.0 / (2.0 * sigma * sigma)
+    gamma = 1.0 / (2.0 * sigma * sigma)             # RBF gamma parameter
 
-    # Kernel matrices (no diagonal contributions in Kxx/Kyy for unbiased estimator)
-    Kxx = torch.exp(-gamma * Kxx_d2)
-    Kyy = torch.exp(-gamma * Kyy_d2)
-    Kxy = torch.exp(-gamma * Kxy_d2)
+    # Kernel matrices (exclude diagonal terms for unbiased MMD^2)
+    Kxx = torch.exp(-gamma * Kxx_d2)                # (n, n)
+    Kyy = torch.exp(-gamma * Kyy_d2)                # (m, m)
+    Kxy = torch.exp(-gamma * Kxy_d2)                # (n, m)
 
-    n = X.size(0); m = Y.size(0)
-    # Remove diagonal terms from intra-set kernels
+    n = X.size(0); m = Y.size(0)                    # sample sizes
+    # Unbiased MMD^2 estimate (Gretton et al., remove self-similarities)
     mmd2 = (Kxx.sum() - Kxx.diag().sum()) / (n * (n - 1)) \
          + (Kyy.sum() - Kyy.diag().sum()) / (m * (m - 1)) \
          - 2.0 * Kxy.mean()
 
-    return float(mmd2.item()), float(sigma)
+    return float(mmd2.item()), float(sigma)         # return scalar MMD^2 and the bandwidth used
 
 def mmd_permutation_pvalue(fake: np.ndarray, real: np.ndarray, mmd_obs: float, sigma: float,
                            n_perm: int, seed: int) -> float:
     """
     Permutation p-value for MMD^2: shuffle labels across the joint sample and recompute MMD^2.
+    Returns the (right-tailed) p-value.
     """
-    Z = np.concatenate([fake, real], axis=0)
-    n = fake.shape[0]
-    rng = np.random.default_rng(seed)
-    cnt = 0
+    Z = np.concatenate([fake, real], axis=0)        # joint pool of features
+    n = fake.shape[0]                               # size of the first group
+    rng = np.random.default_rng(seed)               # RNG for permutations
+    cnt = 0                                         # count how many permuted >= observed
     for _ in range(n_perm):
-        idx = rng.permutation(Z.shape[0])
-        Xp = Z[idx[:n]]
-        Yp = Z[idx[n:]]
-        mmd_p, _ = mmd2_rbf_unbiased(Xp, Yp, sigma=sigma)
+        idx = rng.permutation(Z.shape[0])           # permute indices
+        Xp = Z[idx[:n]]                             # permuted group A
+        Yp = Z[idx[n:]]                             # permuted group B
+        mmd_p, _ = mmd2_rbf_unbiased(Xp, Yp, sigma=sigma)  # recompute MMD^2 using fixed sigma
         if mmd_p >= mmd_obs:
             cnt += 1
-    return (cnt + 1) / (n_perm + 1)  # add-one smoothing
+    return (cnt + 1) / (n_perm + 1)                 # add-one smoothing
 
 # ------------------------------- MAIN -------------------------------
 def main():
-    args = parse_args()
-    np.random.seed(args.seed); torch.manual_seed(args.seed)
+    args = parse_args()                              # read CLI args
+    np.random.seed(args.seed); torch.manual_seed(args.seed)  # set seeds for reproducibility
 
     # Device for Inception: prefer GPU if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, transform = build_inception_and_transform(device)
+    model, transform = build_inception_and_transform(device)  # model + preprocessing
 
-    # Extract features (Nx2048) for both sets
+    # Extract features (N×2048) for both sets
     print("[features] extracting Inception features ...")
-    F = extract_features(args.fake_dir, model, transform, args.batch, device)
-    R = extract_features(args.real_dir, model, transform, args.batch, device)
+    F = extract_features(args.fake_dir, model, transform, args.batch, device)  # fake features
+    R = extract_features(args.real_dir, model, transform, args.batch, device)  # real features
     print(f"fake: {F.shape}, real: {R.shape}")
 
-    report = {}
+    report = {}                                      # dictionary to optionally serialize as JSON
 
     # ---- C2ST ----
     if args.test in ("c2st", "both"):
         print("[C2ST] training logistic regression and running permutation test ...")
-        auc, p = c2st_auc_pvalue(F, R, seed=args.seed, n_perm=args.permutations)
+        auc, p = c2st_auc_pvalue(F, R, seed=args.seed, n_perm=args.permutations)  # statistic + p-value
         report["c2st_auc"] = auc
         report["c2st_p_value"] = p
         print(f"C2ST ROC-AUC: {auc:.4f} | p-value: {p:.4f}")
@@ -222,9 +224,9 @@ def main():
     # ---- MMD ----
     if args.test in ("mmd", "both"):
         print("[MMD] computing unbiased MMD^2 (RBF) and permutation test ...")
-        mmd2, sigma = mmd2_rbf_unbiased(F, R, sigma=None)
+        mmd2, sigma = mmd2_rbf_unbiased(F, R, sigma=None)                         # compute statistic
         pval = mmd_permutation_pvalue(F, R, mmd_obs=mmd2, sigma=sigma,
-                                      n_perm=args.permutations, seed=args.seed)
+                                      n_perm=args.permutations, seed=args.seed)   # permutation p-value
         report["mmd2_rbf"] = mmd2
         report["mmd_sigma"] = sigma
         report["mmd_p_value"] = pval
@@ -232,10 +234,11 @@ def main():
 
     # Optionally dump a JSON report
     if args.save_json:
-        Path(args.save_json).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.save_json).parent.mkdir(parents=True, exist_ok=True)            # ensure folder exists
         with open(args.save_json, "w") as f:
-            json.dump(report, f, indent=2)
+            json.dump(report, f, indent=2)                                        # write results
         print(f"[report] saved -> {args.save_json}")
 
 if __name__ == "__main__":
-    main()
+    main()  # hand off to main() when run as a script
+

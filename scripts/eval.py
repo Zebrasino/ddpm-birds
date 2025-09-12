@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import argparse, os, sys, math, glob
 from pathlib import Path
 import torch
