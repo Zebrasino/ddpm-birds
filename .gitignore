@@ -16,3 +16,5 @@ cub*/
 *.tar.gz
 *.zip
 runs/
+outputs/last.ckpt
+outputs/*.ckpt
