@@ -18,3 +18,4 @@ cub*/
 runs/
 outputs/last.ckpt
 outputs/*.ckpt
+*.ckpt
