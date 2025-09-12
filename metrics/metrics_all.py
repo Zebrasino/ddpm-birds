@@ -1,165 +1,286 @@
 # metrics/metrics_all.py
-# Compute FID, KID (torch-fidelity), PRDC (precision/recall/density/coverage),
-# and C2ST (classifier two-sample test) on Inception features.
-# Usage:
-#   python metrics/metrics_all.py \
-#       --fake_dir "/content/.../ddim_1k" \
-#       --real_dir "/content/cub64_real_train_1k" \
-#       --batch 64 --kid-subsets 50 --kid-subset-size 1000 --permutations 200
+#!/usr/bin/env python3
+"""
+Unified metrics script:
+- FID / KID via torch-fidelity (robust across versions).
+- PRDC (precision/recall/density/coverage) from Inception-2048 features.
+- C2ST (Classifier Two-Sample Test) via logistic regression + permutation p-value.
 
-import argparse, os, math, warnings
+Usage:
+  python metrics_all.py --fake_dir <FAKE> --real_dir <REAL> --batch 64 --kid-subsets 50 --kid-subset-size 1000
+
+This file is patched to:
+- Use torchvision inception_v3 with aux_logits=True (required by recent torchvision).
+- Tolerate different KID dict keys from torch-fidelity (mean/std/variance variants).
+"""
+
+import argparse, os, math, glob
 from pathlib import Path
-from PIL import Image
+
 import numpy as np
-import torch, torchvision as tv
+import torch
+import torchvision as tv
 from torchvision import transforms as T
+from torchvision.models.feature_extraction import create_feature_extractor
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
 
-# ---- Optional: silence PIL/Torch warnings to keep logs clean
-warnings.filterwarnings("ignore", category=UserWarning)
+from sklearn.neighbors import NearestNeighbors
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+from sklearn.utils import shuffle as sk_shuffle
 
-def parse_args():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--fake_dir", type=str, required=True, help="Folder with generated PNGs")
-    ap.add_argument("--real_dir", type=str, required=True, help="Folder with real PNGs (same resolution)")
-    ap.add_argument("--batch", type=int, default=64, help="Batch size for feature extraction")
-    ap.add_argument("--kid-subsets", type=int, default=50, help="Number of subsets for KID")
-    ap.add_argument("--kid-subset-size", type=int, default=1000, help="Subset size for each KID estimate")
-    ap.add_argument("--permutations", type=int, default=200, help="Permutations for C2ST p-value")
-    ap.add_argument("--seed", type=int, default=0, help="Random seed for reproducibility")
-    return ap.parse_args()
+# FID/KID backend
+from torch_fidelity import calculate_metrics as tf_calculate_metrics
 
-# ---------- Inception feature extractor (2048-D pre-logits) ----------
-def build_inception_and_transform(device):
-    """Return (inception_model, transform) for 2048-D pre-logit features."""
+
+# ----------------------------- IO & datasets -----------------------------
+
+IMG_EXT = (".png", ".jpg", ".jpeg")
+
+
+class FlatImageFolder(Dataset):
+    """Flat folder of images."""
+    def __init__(self, folder: str, transform):
+        self.paths = sorted([p for p in glob.glob(os.path.join(folder, "*")) if p.lower().endswith(IMG_EXT)])
+        self.transform = transform
+
+    def __len__(self): return len(self.paths)
+
+    def __getitem__(self, idx):
+        p = self.paths[idx]
+        img = Image.open(p).convert("RGB")
+        return self.transform(img)
+
+
+def build_inception_and_transform(device: torch.device):
+    """
+    Build an InceptionV3 and its preprocessing transform.
+    Uses torchvision weights API when available; falls back to pretrained=True otherwise.
+    IMPORTANT: aux_logits=True for recent torchvision.
+    Returns (model.eval().to(device), transform)
+    """
     try:
         weights = tv.models.Inception_V3_Weights.IMAGENET1K_V1
-        model = tv.models.inception_v3(weights=weights, aux_logits=False).to(device).eval()
+        model = tv.models.inception_v3(weights=weights, aux_logits=True).to(device).eval()
         transform = weights.transforms()
     except Exception:
-        # Fallback for older torchvision
-        model = tv.models.inception_v3(pretrained=True, aux_logits=False).to(device).eval()
+        model = tv.models.inception_v3(pretrained=True, aux_logits=True).to(device).eval()
         transform = T.Compose([
             T.Resize(299, interpolation=T.InterpolationMode.BICUBIC),
             T.CenterCrop(299),
             T.ToTensor(),
-            T.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225]),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ])
-    return model, transform
+    # Extract 2048-dim features from 'avgpool'
+    feat_extractor = create_feature_extractor(model, return_nodes={'avgpool': 'feat'})
+    return feat_extractor, transform
+
 
 @torch.no_grad()
-def extract_inception_features(dirpath, model, transform, batch=64, device="cuda"):
-    """Extract 2048-D features from all PNG files in dirpath."""
-    paths = sorted([p for p in Path(dirpath).glob("*.png")])
-    if len(paths) == 0:
-        raise FileNotFoundError(f"No PNG files found in {dirpath}. Ensure a flat folder of images.")
-    features, hook_out = [], []
-    # Hook the avgpool to grab pre-logit features (B,2048,1,1)
-    def _hook(m, i, o): hook_out.append(o.squeeze(-1).squeeze(-1))
-    h = model.avgpool.register_forward_hook(_hook)
-    for i in range(0, len(paths), batch):
-        imgs = [transform(Image.open(p).convert("RGB")) for p in paths[i:i+batch]]
-        x = torch.stack(imgs, 0).to(device)
-        hook_out.clear()
-        _ = model(x)
-        features.append(hook_out[0].detach().cpu())
-    h.remove()
-    return torch.cat(features, 0).numpy()  # (N, 2048)
+def extract_inception_features(folder: str, batch: int, device: torch.device) -> np.ndarray:
+    """Return Nx2048 features for all images in `folder`."""
+    model, transform = build_inception_and_transform(device)
+    ds = FlatImageFolder(folder, transform)
+    if len(ds) == 0:
+        return np.zeros((0, 2048), dtype=np.float32)
+    dl = DataLoader(ds, batch_size=batch, shuffle=False, num_workers=2, pin_memory=(device.type == "cuda"))
+    feats = []
+    for x in dl:
+        x = x.to(device, non_blocking=True)
+        y = model(x)['feat'].squeeze(-1).squeeze(-1)  # (B, 2048, 1, 1) -> (B, 2048)
+        feats.append(y.cpu().numpy().astype(np.float32))
+    return np.concatenate(feats, axis=0)
 
-# ---------- FID/KID via torch-fidelity (Python API) ----------
-def compute_fid_kid(fake_dir, real_dir, kid_subset_size=1000, kid_subsets=50, batch_size=64):
-    from torch_fidelity import calculate_metrics
-    kid_subset_size = int(min(kid_subset_size,
-                              len(list(Path(fake_dir).glob("*.png"))),
-                              len(list(Path(real_dir).glob("*.png")))))
-    metrics = calculate_metrics(
-        input1=fake_dir, input2=real_dir,
-        fid=True, kid=True, isc=False,               # IS optional; often noisy on small N
-        kid_subset_size=kid_subset_size, kid_subsets=kid_subsets,
-        batch_size=batch_size,
-    )
-    return metrics  # dict with 'frechet_inception_distance', 'kernel_inception_distance_mean', '..._var'
 
-# ---------- PRDC (precision, recall, density, coverage) ----------
-def compute_prdc(fake_feats, real_feats, k=5):
-    from prdc import compute_prdc
-    res = compute_prdc(real_features=real_feats, fake_features=fake_feats, nearest_k=k)
-    # Convert to Python floats for clean printing
-    return {k: float(v) for k, v in res.items()}
+# ----------------------------- PRDC -----------------------------
 
-# ---------- C2ST (classifier two-sample test) with Logistic Regression ----------
-def c2st_auc_pvalue(fake_feats, real_feats, seed=0, permutations=200):
-    """Train logistic regression to discriminate fake vs real on features;
-       return (roc_auc, permutation_p_value)."""
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.metrics import roc_auc_score
-    from sklearn.model_selection import train_test_split
+def compute_prdc(real: np.ndarray, fake: np.ndarray, k: int = 5):
+    """
+    Precision/Recall/Density/Coverage as in Kynkäänniemi et al. (2019).
+    real, fake: (N, D) arrays of features.
+    """
+    # Fit NN on real for kNN radius
+    nn_real = NearestNeighbors(n_neighbors=k, algorithm='auto').fit(real)
+    # k-th NN distances (radius) in real-real space
+    rr_dists, _ = nn_real.kneighbors(real)   # (N, k)
+    radii = rr_dists[:, -1]                  # (N,)
+    # For fast membership tests, we need nearest real neighbor for each fake
+    rf_dists, rf_idx = nn_real.kneighbors(fake, n_neighbors=1)  # (M,1)
+    rf_dists = rf_dists.squeeze(1)         # (M,)
+    rf_idx = rf_idx.squeeze(1)             # (M,)
 
-    X = np.concatenate([fake_feats, real_feats], axis=0)
-    y = np.concatenate([np.zeros(len(fake_feats)), np.ones(len(real_feats))], axis=0)
+    # Precision: fraction of fake within the radius of their nearest real
+    precision = float(np.mean(rf_dists <= radii[rf_idx]))
 
-    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.3, stratify=y, random_state=seed)
-    clf = LogisticRegression(max_iter=1000, n_jobs=1)
-    clf.fit(Xtr, ytr)
-    proba = clf.predict_proba(Xte)[:, 1]
-    auc_obs = float(roc_auc_score(yte, proba))
+    # Recall: fraction of real that have at least one fake within their radius
+    nn_fake = NearestNeighbors(n_neighbors=1, algorithm='auto').fit(fake)
+    fr_dists, _ = nn_fake.kneighbors(real, n_neighbors=1)  # (N,1)
+    fr_dists = fr_dists.squeeze(1)                         # (N,)
+    recall = float(np.mean(fr_dists <= radii))
 
-    # Permutation test on the test split
-    rng = np.random.default_rng(seed)
-    cnt = 0
+    # Density: average number of real neighbors within radius (normalized by k)
+    # Count how many real points are within each fake's radius (of its matched real).
+    # Approximate via distance ratio exp(-dist/radius) surrogate:
+    # A simpler practical proxy: precision * k (as in some open-source impls).
+    # We'll compute a more faithful proxy via brute-force local neighborhood per fake:
+    # Use the same nn_real structure to query how many neighbors are within radius for each fake.
+    # sklearn kneighbors doesn't support variable radius directly; use radius_neighbors.
+    # If radius is zero for some real point, fall back to small epsilon.
+    eps = 1e-12
+    radii_fake = np.maximum(radii[rf_idx], eps)  # radius of matched real
+    # Count neighbors within each radius using radius_neighbors (returns list of arrays)
+    # To avoid OOM, process in chunks
+    counts = []
+    step = 200
+    for i in range(0, fake.shape[0], step):
+        neighs = nn_real.radius_neighbors(fake[i:i+step], radii_fake[i:i+step], return_distance=False)
+        counts.extend([len(n) for n in neighs])
+    density = float(np.mean(np.array(counts, dtype=np.float32) / float(k)))
+
+    # Coverage: fraction of real covered by at least one fake (within that real's radius)
+    # Use same fr_dists <= radii criterion
+    coverage = float(np.mean(fr_dists <= radii))
+
+    return {
+        "precision": precision,
+        "recall": recall,
+        "density": density,
+        "coverage": coverage,
+    }
+
+
+# ----------------------------- C2ST -----------------------------
+
+def c2st_logreg(real: np.ndarray, fake: np.ndarray, permutations: int = 200, seed: int | None = None):
+    """
+    Classifier two-sample test with logistic regression.
+    Returns dict with AUC, null distribution mean/std, p-value.
+    """
+    rng = np.random.RandomState(seed)
+    X = np.vstack([real, fake]).astype(np.float32)
+    y = np.hstack([np.zeros(len(real), dtype=np.int64), np.ones(len(fake), dtype=np.int64)])
+
+    # Train/Val split (stratified)
+    idx = np.arange(len(X))
+    idx = sk_shuffle(idx, random_state=rng)
+    split = int(0.8 * len(idx))
+    tr, va = idx[:split], idx[split:]
+
+    clf = LogisticRegression(max_iter=1000, n_jobs=None)
+    clf.fit(X[tr], y[tr])
+    prob = clf.predict_proba(X[va])[:, 1]
+    auc = roc_auc_score(y[va], prob)
+
+    # Permutation test: shuffle labels, refit, compute AUC each time
+    null_aucs = []
     for _ in range(permutations):
-        yperm = rng.permutation(yte)
-        auc_p = roc_auc_score(yperm, proba)
-        if auc_p >= auc_obs:
-            cnt += 1
-    pval = (cnt + 1) / (permutations + 1)           # add-one smoothing
-    return auc_obs, pval
+        y_perm = y.copy()
+        rng.shuffle(y_perm)
+        clf_p = LogisticRegression(max_iter=300, n_jobs=None)
+        clf_p.fit(X[tr], y_perm[tr])
+        prob_p = clf_p.predict_proba(X[va])[:, 1]
+        null_aucs.append(roc_auc_score(y[va], prob_p))
+    null_aucs = np.asarray(null_aucs, dtype=np.float32)
+    # p-value: fraction of null >= observed (right-tailed)
+    pval = float((null_aucs >= auc).mean())
+
+    return {
+        "auc": float(auc),
+        "null_mean": float(null_aucs.mean()),
+        "null_std": float(null_aucs.std(ddof=1) if len(null_aucs) > 1 else 0.0),
+        "p_value": pval,
+    }
+
+
+# ----------------------------- KID helpers -----------------------------
+
+def read_kid_fields(d: dict):
+    """
+    Robustly read KID value and uncertainty from torch-fidelity dict across versions.
+    Returns (value, uncertainty, tag) where tag is 'var' or 'std' or ''.
+    """
+    val = d.get('kernel_inception_distance') \
+          or d.get('kernel_inception_distance_mean') \
+          or d.get('kid')
+    var = d.get('kernel_inception_distance_variance')
+    std = d.get('kernel_inception_distance_std') or d.get('kid_std')
+    if var is not None:
+        return val, var, 'var'
+    if std is not None:
+        return val, std, 'std'
+    return val, None, ''
+
+
+# ----------------------------- Main -----------------------------
+
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--fake_dir", type=str, required=True)
+    ap.add_argument("--real_dir", type=str, required=True)
+    ap.add_argument("--batch", type=int, default=64)
+    ap.add_argument("--kid-subsets", type=int, default=50)
+    ap.add_argument("--kid-subset-size", type=int, default=1000)
+    ap.add_argument("--permutations", type=int, default=200)
+    ap.add_argument("--seed", type=int, default=None)
+    return ap.parse_args()
+
 
 def main():
     args = parse_args()
-    # Seed everything lightly
-    torch.manual_seed(args.seed); np.random.seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Quick sanity: count files
-    fake_n = len(list(Path(args.fake_dir).glob("*.png")))
-    real_n = len(list(Path(args.real_dir).glob("*.png")))
+    # Count files
+    fake_n = len([p for p in glob.glob(os.path.join(args.fake_dir, "*")) if p.lower().endswith(IMG_EXT)])
+    real_n = len([p for p in glob.glob(os.path.join(args.real_dir, "*")) if p.lower().endswith(IMG_EXT)])
     print(f"[check] fake={fake_n} png | real={real_n} png")
     assert fake_n >= 100 and real_n >= 100, "Need enough images (>=100); aim for 1000 vs 1000."
 
-    # Device for feature extraction
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    inception, transform = build_inception_and_transform(device)
+    # 1) FID / KID (torch-fidelity)
+    print("\n[1/3] Computing FID / KID ...\n")
+    fidkid = tf_calculate_metrics(
+        input1=args.fake_dir,
+        input2=args.real_dir,
+        cuda=torch.cuda.is_available(),
+        isc=False,
+        fid=True,
+        kid=True,
+        kid_subset_size=args.kid_subset_size,
+        kid_subsets=args.kid_subsets,
+        verbose=False,
+    )
+    fid = fidkid.get('frechet_inception_distance')
+    kid_val, kid_unc, kid_tag = read_kid_fields(fidkid)
+    print("================= METRICS REPORT =================")
+    if fid is not None:
+        print(f"FID: {fid:.4f}")
+    if kid_val is not None:
+        line = f"KID: {kid_val:.8f}"
+        if kid_unc is not None:
+            line += f" ({kid_tag}: {kid_unc:.8f})"
+        print(line)
 
-    # ---- 1) FID / KID
-    print("\n[1/3] Computing FID / KID ...")
-    fidkid = compute_fid_kid(args.fake_dir, args.real_dir,
-                             kid_subset_size=args.kid_subset_size,
-                             kid_subsets=args.kid_subsets,
-                             batch_size=args.batch)
-    # ---- 2) PRDC
+    # 2) PRDC (from 2048-dim features)
     print("\n[2/3] Extracting Inception features for PRDC/C2ST ...")
-    fake_feats = extract_inception_features(args.fake_dir, inception, transform,
-                                            batch=args.batch, device=device)
-    real_feats = extract_inception_features(args.real_dir, inception, transform,
-                                            batch=args.batch, device=device)
-    print(f"Feature shapes: fake={fake_feats.shape}, real={real_feats.shape}")
+    fake_feat = extract_inception_features(args.fake_dir, args.batch, device)  # (M,2048)
+    real_feat = extract_inception_features(args.real_dir, args.batch, device)  # (N,2048)
+    print(f"Feature shapes: fake={fake_feat.shape}, real={real_feat.shape}")
 
     print("\n[2/3] Computing PRDC (k=5) ...")
-    prdc = compute_prdc(fake_feats, real_feats, k=5)
+    print(f"Num real: {len(real_feat)} Num fake: {len(fake_feat)}")
+    prdc = compute_prdc(real_feat, fake_feat, k=5)
+    print(f"Precision: {prdc['precision']:.4f}")
+    print(f"Recall:    {prdc['recall']:.4f}")
+    print(f"Density:   {prdc['density']:.4f}")
+    print(f"Coverage:  {prdc['coverage']:.4f}")
 
-    # ---- 3) C2ST (discriminator-based two-sample test)
+    # 3) C2ST (logistic regression + permutation)
     print("\n[3/3] Running C2ST (logistic regression, permutation test) ...")
-    auc, pval = c2st_auc_pvalue(fake_feats, real_feats,
-                                seed=args.seed, permutations=args.permutations)
+    c2 = c2st_logreg(real_feat, fake_feat, permutations=args.permutations, seed=args.seed)
+    print(f"AUC:       {c2['auc']:.4f}")
+    print(f"Null μ:    {c2['null_mean']:.4f}  σ: {c2['null_std']:.4f}")
+    print(f"p-value:   {c2['p_value']:.6f}")
 
-    # ---- Report
-    print("\n================= METRICS REPORT =================")
-    print(f"FID: {fidkid['frechet_inception_distance']:.4f}")
-    print(f"KID mean: {fidkid['kernel_inception_distance_mean']:.6f} "
-          f"(var: {fidkid['kernel_inception_distance_variance']:.6f})")
-    print(f"PRDC: precision={prdc['precision']:.4f}, recall={prdc['recall']:.4f}, "
-          f"density={prdc['density']:.4f}, coverage={prdc['coverage']:.4f}")
-    print(f"C2ST: ROC-AUC={auc:.4f}, p-value={pval:.4f}")
-    print("==================================================")
 
 if __name__ == "__main__":
     main()
