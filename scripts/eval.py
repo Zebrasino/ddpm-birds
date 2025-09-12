@@ -69,7 +69,8 @@ def main():
     state = ck.get("ema") if (args.use_ema and ck.get("ema") is not None) else ck["model"]
     msd = model.state_dict()
     for k in msd:
-        if k in state: msd[k].copy_(state[k])
+        if k in state:
+            msd[k].copy_(state[k])
 
     diff = Diffusion(T=T, schedule=schedule, device=torch.device(device))
 
@@ -110,4 +111,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
