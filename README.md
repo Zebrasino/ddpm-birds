@@ -53,7 +53,7 @@ Two-sample test with a small discriminator:
 python eval.py --task two_sample --checkpoint runs/last.ckpt --real_dir /path/to/real/images --img_size 64
 ```
 
-##Results
+## Results
 Below are a few examples of generated image grids at different sampling configurations:
 
 <p align="center"> <img src="assets/grid_1.png" width="250" /><img src="assets/grid_2.png" width="250" /> 
