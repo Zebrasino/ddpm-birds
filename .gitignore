@@ -19,3 +19,4 @@ runs/
 outputs/last.ckpt
 outputs/*.ckpt
 *.ckpt
+*.ckpt_
